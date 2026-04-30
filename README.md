@@ -1,6 +1,6 @@
 # NIFTY Options Writing Research Lab
 
-This repository contains a research workflow for NIFTY option-writing strategies using Zerodha/Kite data where possible, plus normalized CSV inputs for older expired option chains.
+This repository contains a research workflow for NIFTY option-writing strategies using Zerodha/Kite data where possible, plus normalized CSV inputs for older expired option chains. It also includes a small Flask dashboard for Render deployment.
 
 It is built for research, not live trading. No strategy here should be treated as a sure-shot signal. Option writing can show a high win rate while hiding rare, large losses, so the reports focus on drawdown, tail loss, realistic charges, and position sizing.
 
@@ -20,7 +20,33 @@ Kite can still fetch:
 - Current live NIFTY option contracts.
 - Recent/active contract candles while the contracts are still available.
 
-## Setup
+## Render Deployment
+
+The repo includes `app.py`, `requirements.txt`, `runtime.txt`, and `render.yaml`.
+
+Blueprint deploy:
+
+1. Open Render and choose New > Blueprint.
+2. Connect `Bhavin-Nasit/nifty-options-writing-lab`.
+3. Render will read `render.yaml`.
+4. Deploy the `nifty-options-writing-lab` web service.
+
+Manual web service deploy:
+
+1. Open Render and choose New > Web Service.
+2. Connect `Bhavin-Nasit/nifty-options-writing-lab`.
+3. Use Python runtime.
+4. Build command: `pip install -r requirements.txt`
+5. Start command: `gunicorn app:app`
+6. Health check path: `/healthz`
+
+The deployed app exposes:
+
+- `/` dashboard preview
+- `/api/strategy-configs` strategy config JSON
+- `/healthz` Render health check
+
+## Local Setup
 
 From the repository root:
 
@@ -32,6 +58,14 @@ Copy-Item .env.example .env
 ```
 
 Edit `.env` locally. Do not paste API secrets into chat.
+
+Run the dashboard locally:
+
+```powershell
+python app.py
+```
+
+Open `http://localhost:8050`.
 
 ## Capture Data
 
