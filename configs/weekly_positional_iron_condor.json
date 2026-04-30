@@ -1,0 +1,19 @@
+{
+  "name": "weekly_positional_iron_condor_defined_risk",
+  "strategy": "iron_condor",
+  "capital": 400000,
+  "risk_per_trade_pct": 0.06,
+  "max_lots": 3,
+  "lot_size": 50,
+  "entry_dte": 3,
+  "entry_time": "15:20",
+  "exit_dte": 0,
+  "exit_time": "15:10",
+  "strike_step": 50,
+  "short_distance": 250,
+  "wing_width": 300,
+  "min_net_credit": 45,
+  "stop_loss_close_value_multiple": 1.9,
+  "profit_target_capture_pct": 0.6,
+  "slippage_bps": 5
+}

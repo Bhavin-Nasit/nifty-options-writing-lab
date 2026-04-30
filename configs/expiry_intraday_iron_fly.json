@@ -1,0 +1,17 @@
+{
+  "name": "expiry_intraday_iron_fly_defined_risk",
+  "strategy": "iron_fly",
+  "capital": 1800000,
+  "risk_per_trade_pct": 0.035,
+  "max_lots": 12,
+  "lot_size": 50,
+  "entry_dte": 0,
+  "entry_time": "09:20",
+  "exit_time": "15:10",
+  "strike_step": 50,
+  "wing_width": 300,
+  "min_net_credit": 65,
+  "stop_loss_close_value_multiple": 1.75,
+  "profit_target_capture_pct": 0.55,
+  "slippage_bps": 4
+}
