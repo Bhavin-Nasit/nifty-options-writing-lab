@@ -1,6 +1,6 @@
 # NIFTY Options Writing Research Lab
 
-This folder contains a local research workflow for NIFTY option-writing strategies using Zerodha/Kite data where possible, plus normalized CSV inputs for older expired option chains.
+This repository contains a research workflow for NIFTY option-writing strategies using Zerodha/Kite data where possible, plus normalized CSV inputs for older expired option chains.
 
 It is built for research, not live trading. No strategy here should be treated as a sure-shot signal. Option writing can show a high win rate while hiding rare, large losses, so the reports focus on drawdown, tail loss, realistic charges, and position sizing.
 
@@ -28,35 +28,35 @@ From the repository root:
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-Copy-Item nifty_options_lab\.env.example nifty_options_lab\.env
+Copy-Item .env.example .env
 ```
 
-Edit `nifty_options_lab\.env` locally. Do not paste API secrets into chat.
+Edit `.env` locally. Do not paste API secrets into chat.
 
 ## Capture Data
 
 Snapshot the current Kite instrument dump:
 
 ```powershell
-python nifty_options_lab\run.py snapshot-instruments --env nifty_options_lab\.env
+python run.py snapshot-instruments --env .env
 ```
 
 Fetch NIFTY spot candles:
 
 ```powershell
-python nifty_options_lab\run.py fetch-spot --env nifty_options_lab\.env --from 2024-01-01 --to 2024-12-31 --interval 5minute
+python run.py fetch-spot --env .env --from 2024-01-01 --to 2024-12-31 --interval 5minute
 ```
 
 Fetch currently active NIFTY option candles:
 
 ```powershell
-python nifty_options_lab\run.py fetch-active-options --env nifty_options_lab\.env --from 2026-04-01 --to 2026-04-29 --interval 5minute --max-contracts 40
+python run.py fetch-active-options --env .env --from 2026-04-01 --to 2026-04-29 --interval 5minute --max-contracts 40
 ```
 
 For old 5-year option backtests, place a normalized options CSV at:
 
 ```text
-nifty_options_lab\data\processed\nifty_options.csv
+data\processed\nifty_options.csv
 ```
 
 Expected columns:
@@ -68,7 +68,7 @@ timestamp,expiry,strike,option_type,open,high,low,close,volume,oi,tradingsymbol,
 Place NIFTY spot candles at:
 
 ```text
-nifty_options_lab\data\processed\nifty_spot.csv
+data\processed\nifty_spot.csv
 ```
 
 Expected columns:
@@ -82,19 +82,19 @@ timestamp,open,high,low,close,volume
 Expiry-day defined-risk iron fly:
 
 ```powershell
-python nifty_options_lab\run.py backtest --options nifty_options_lab\data\processed\nifty_options.csv --spot nifty_options_lab\data\processed\nifty_spot.csv --config nifty_options_lab\configs\expiry_intraday_iron_fly.json --out nifty_options_lab\reports
+python run.py backtest --options data\processed\nifty_options.csv --spot data\processed\nifty_spot.csv --config configs\expiry_intraday_iron_fly.json --out reports
 ```
 
 Weekly positional iron condor:
 
 ```powershell
-python nifty_options_lab\run.py backtest --options nifty_options_lab\data\processed\nifty_options.csv --spot nifty_options_lab\data\processed\nifty_spot.csv --config nifty_options_lab\configs\weekly_positional_iron_condor.json --out nifty_options_lab\reports
+python run.py backtest --options data\processed\nifty_options.csv --spot data\processed\nifty_spot.csv --config configs\weekly_positional_iron_condor.json --out reports
 ```
 
 Build daily institutional/volatility features:
 
 ```powershell
-python nifty_options_lab\run.py build-features --spot nifty_options_lab\data\processed\nifty_spot.csv --participant-oi nifty_options_lab\data\processed\participant_oi.csv --fii-derivatives nifty_options_lab\data\processed\fii_derivatives.csv --vix nifty_options_lab\data\processed\india_vix.csv
+python run.py build-features --spot data\processed\nifty_spot.csv --participant-oi data\processed\participant_oi.csv --fii-derivatives data\processed\fii_derivatives.csv --vix data\processed\india_vix.csv
 ```
 
 Expected normalized institutional columns are lowercase snake case. Useful examples:
