@@ -1,28 +1,43 @@
 # NIFTY Options Writing Research Lab
 
-This repository contains a research workflow for NIFTY option-writing strategies using Zerodha/Kite data where possible, plus normalized CSV inputs for older expired option chains. It also includes a small Flask dashboard for Render deployment.
+This repository contains a hosted NIFTY options action board plus research scripts for option-writing backtests. The Render dashboard now uses public NSE option-chain data and does not require daily Kite token updates.
 
 It is built for research, not live trading. No strategy here should be treated as a sure-shot signal. Option writing can show a high win rate while hiding rare, large losses, so the reports focus on drawdown, tail loss, realistic charges, and position sizing.
 
-## Important Kite Limitation
+## Hosted Action Board
 
-Kite historical candles are fetched by `instrument_token`. NFO option contracts expire, and Kite's live instrument dump only contains currently tradable contracts. Zerodha's own docs state that instrument tokens change by expiry and the instrument master only returns live contracts; continuous historical data is for futures day candles, not old option chains.
+The dashboard derives weekly and monthly writing plans from the public NSE NIFTY option chain:
 
-That means a true 5-year NIFTY options backtest needs one of these:
+- NIFTY spot from the option-chain payload.
+- Current weekly and monthly expiries from NSE expiry dates.
+- PE/CE short strikes selected using OI, positive OI change, traded volume, premium, and distance buffer.
+- Hedge strikes added automatically to form defined-risk iron condors.
+- Net credit, approximate max risk, target, stop reference, OI, volume, and IV shown on screen.
+
+No broker token is required. The app caches NSE data server-side for `NSE_CACHE_SECONDS`, default `900` seconds.
+
+Optional Render environment variables:
+
+```text
+NSE_CACHE_SECONDS=900
+NIFTY_LOT_SIZE=65
+```
+
+If NSE blocks or rate-limits the hosted request and no cached board exists, the app clearly switches to SAMPLE mode. Do not trade from SAMPLE mode.
+
+## Important Data Limitation
+
+The hosted dashboard is for planning weekly/monthly writing candidates from currently available option-chain data. It is not a full institutional backtest by itself. A true 5-year NIFTY options backtest still needs one of these:
 
 1. Your own archived option instrument dumps and historical option candles.
 2. A paid vendor export containing historical NIFTY option chains.
 3. NSE F&O bhavcopy/UDiFF archives for EOD-level testing, with intraday tests limited to the period where you have intraday options data.
 
-Kite can still fetch:
-
-- NIFTY spot/index candles.
-- Current live NIFTY option contracts.
-- Recent/active contract candles while the contracts are still available.
+Kite can still be used locally for historical/recent candles, but it is not required for the hosted dashboard.
 
 ## Render Deployment
 
-Use **New > Web Service** if you want the same flow as your other dashboards. A Blueprint is just infrastructure-as-code: Render reads `render.yaml` and creates/configures the service automatically. A Web Service is the actual running app. Blueprint is useful for many services or reproducible config, but for this repo a manual Web Service is simpler.
+Use New > Web Service if you want the same flow as your other dashboards.
 
 Manual web service deploy:
 
@@ -32,13 +47,14 @@ Manual web service deploy:
 4. Build command: `pip install -r requirements.txt`
 5. Start command: `gunicorn app:app`
 6. Health check path: `/healthz`
-7. Add environment variable `PYTHON_VERSION=3.11.11` if Render does not pick it up automatically.
+7. Optional env vars: `NSE_CACHE_SECONDS=900`, `NIFTY_LOT_SIZE=65`.
 
 Blueprint deploy is also supported through `render.yaml`, but it is optional.
 
 The deployed app exposes:
 
-- `/` dashboard preview
+- `/` action board
+- `/api/action-plan` JSON action plan
 - `/api/strategy-configs` strategy config JSON
 - `/healthz` Render health check
 
@@ -55,14 +71,14 @@ python app.py
 
 Open `http://localhost:8050`.
 
-For research and Kite data capture:
+For research and optional Kite data capture:
 
 ```powershell
 pip install -r requirements-research.txt
 Copy-Item .env.example .env
 ```
 
-Edit `.env` locally. Do not paste API secrets into chat.
+Edit `.env` locally only if you are running Kite capture scripts.
 
 ## Capture Data
 
@@ -128,32 +144,11 @@ Build daily institutional/volatility features:
 python run.py build-features --spot data\processed\nifty_spot.csv --participant-oi data\processed\participant_oi.csv --fii-derivatives data\processed\fii_derivatives.csv --vix data\processed\india_vix.csv
 ```
 
-Expected normalized institutional columns are lowercase snake case. Useful examples:
-
-```text
-date,fii_index_options_long,fii_index_options_short,pro_index_options_long,pro_index_options_short,client_index_options_long,client_index_options_short
-date,index_futures_long,index_futures_short
-date,close
-```
-
 ## Strategy Defaults
 
 - Intraday expiry capital: `1800000`
 - Positional capital: `400000`
-- Default product: defined-risk spreads only
-- Costs: Zerodha F&O options brokerage, STT on sell premium, NSE transaction charges, SEBI charges, stamp duty on buy side, GST. The model uses pre/post 1 April 2026 option STT rates.
-- Sizing: lots are limited by configured risk per trade and `max_lots`
-
-## Institutional Data To Add
-
-For a more institutional-style model, add daily CSVs for:
-
-- Participant-wise OI: Client, FII, DII, Pro long/short positions in index futures/options.
-- FII derivatives statistics.
-- India VIX.
-- NIFTY futures basis.
-- Expiry calendar and holiday-adjusted expiry dates.
-
-These are best used as filters: avoid short-vol trades when VIX is expanding, when FII futures shorts are rising sharply, or when Pro/FII option shorts are unwinding into expiry.
+- Hosted action board: defined-risk iron condor candidates only
+- Costs in the research backtester: Zerodha F&O options brokerage, STT on sell premium, NSE transaction charges, SEBI charges, stamp duty on buy side, GST
 
 Read `STRATEGY_NOTES.md` for the research assumptions behind weekly, monthly, and longer-dated writing.
