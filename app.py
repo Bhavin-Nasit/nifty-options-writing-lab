@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import math
 import os
@@ -13,16 +15,17 @@ from flask import Flask, jsonify, render_template_string
 
 
 ROOT = Path(__file__).resolve().parent
-CONFIG_DIR = ROOT / "configs"
-IST = ZoneInfo("Asia/Kolkata")
-NSE_BASE_URL = "https://www.nseindia.com"
-NSE_CHAIN_URL = f"{NSE_BASE_URL}/api/option-chain-indices?symbol=NIFTY"
-NSE_CHAIN_PAGE = f"{NSE_BASE_URL}/option-chain"
-CACHE_SECONDS = int(os.getenv("NSE_CACHE_SECONDS", "900"))
-NIFTY_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "65"))
+CONFIG_DIR = ROOT / 'configs'
+IST = ZoneInfo('Asia/Kolkata')
+NSE_BASE_URL = 'https://www.nseindia.com'
+NSE_CHAIN_URL = f'{NSE_BASE_URL}/api/option-chain-indices?symbol=NIFTY'
+NSE_CHAIN_PAGE = f'{NSE_BASE_URL}/option-chain'
+NSE_PARTICIPANT_URL = 'https://archives.nseindia.com/content/nsccl/fao_participant_oi_{stamp}.csv'
+CACHE_SECONDS = int(os.getenv('NSE_CACHE_SECONDS', '900'))
+NIFTY_LOT_SIZE = int(os.getenv('NIFTY_LOT_SIZE', '65'))
 
 app = Flask(__name__)
-_CACHE: dict[str, object] = {"expires_at": datetime.min.replace(tzinfo=IST), "board": None}
+_CACHE: dict[str, object] = {'expires_at': datetime.min.replace(tzinfo=IST), 'board': None}
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,8 @@ class OptionRow:
     strike: int
     ce_ltp: float
     pe_ltp: float
+    ce_change: float
+    pe_change: float
     ce_oi: int
     pe_oi: int
     ce_chg_oi: int
@@ -50,7 +55,7 @@ def today_ist() -> date:
 
 
 def now_ist_label() -> str:
-    return now_ist().strftime("%d %b %Y, %I:%M %p IST")
+    return now_ist().strftime('%d %b %Y, %I:%M %p IST')
 
 
 def floor_to_step(value: float, step: int = 50) -> int:
@@ -62,7 +67,7 @@ def ceil_to_step(value: float, step: int = 50) -> int:
 
 
 def parse_nse_expiry(value: str) -> date:
-    return datetime.strptime(value, "%d-%b-%Y").date()
+    return datetime.strptime(value, '%d-%b-%Y').date()
 
 
 def last_expiry_by_month(expiries: list[date]) -> list[date]:
@@ -99,13 +104,25 @@ def fallback_monthly_expiry(base: date) -> date:
 
 def nse_headers() -> dict[str, str]:
     return {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-        "Accept": "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": NSE_CHAIN_PAGE,
-        "Connection": "keep-alive",
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+        'Accept': 'application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': NSE_CHAIN_PAGE,
+        'Connection': 'keep-alive',
     }
+
+
+def safe_number(value: object, default: float = 0.0) -> float:
+    try:
+        if value in (None, '-', ''):
+            return default
+        return float(str(value).replace(',', '').strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_int(value: object, default: int = 0) -> int:
+    return int(safe_number(value, float(default)))
 
 
 def fetch_nse_option_chain() -> dict[str, object]:
@@ -118,46 +135,45 @@ def fetch_nse_option_chain() -> dict[str, object]:
     return response.json()
 
 
-def safe_number(value: object, default: float = 0.0) -> float:
-    try:
-        if value in (None, "-"):
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
 def parse_chain(payload: dict[str, object]) -> tuple[float, str, list[date], list[OptionRow]]:
-    records = payload.get("records", {}) if isinstance(payload, dict) else {}
-    spot = safe_number(records.get("underlyingValue"), 0.0) if isinstance(records, dict) else 0.0
-    timestamp = str(records.get("timestamp") or now_ist_label()) if isinstance(records, dict) else now_ist_label()
-    expiry_values = records.get("expiryDates", []) if isinstance(records, dict) else []
-    expiries = sorted(parse_nse_expiry(value) for value in expiry_values)
+    records = payload.get('records', {}) if isinstance(payload, dict) else {}
+    spot = safe_number(records.get('underlyingValue'), 0.0) if isinstance(records, dict) else 0.0
+    timestamp = str(records.get('timestamp') or now_ist_label()) if isinstance(records, dict) else now_ist_label()
+    expiry_values = records.get('expiryDates', []) if isinstance(records, dict) else []
+    expiries: list[date] = []
+    for value in expiry_values:
+        try:
+            expiries.append(parse_nse_expiry(str(value)))
+        except ValueError:
+            continue
+    expiries = sorted(expiries)
 
     rows: list[OptionRow] = []
-    raw_rows = records.get("data", []) if isinstance(records, dict) else []
+    raw_rows = records.get('data', []) if isinstance(records, dict) else []
     for item in raw_rows:
-        if not isinstance(item, dict) or "expiryDate" not in item:
+        if not isinstance(item, dict) or 'expiryDate' not in item:
             continue
         try:
-            expiry = parse_nse_expiry(str(item["expiryDate"]))
-            strike = int(safe_number(item.get("strikePrice"), 0))
-            ce = item.get("CE") if isinstance(item.get("CE"), dict) else {}
-            pe = item.get("PE") if isinstance(item.get("PE"), dict) else {}
+            expiry = parse_nse_expiry(str(item['expiryDate']))
+            strike = safe_int(item.get('strikePrice'))
+            ce = item.get('CE') if isinstance(item.get('CE'), dict) else {}
+            pe = item.get('PE') if isinstance(item.get('PE'), dict) else {}
             rows.append(
                 OptionRow(
                     expiry=expiry,
                     strike=strike,
-                    ce_ltp=safe_number(ce.get("lastPrice")),
-                    pe_ltp=safe_number(pe.get("lastPrice")),
-                    ce_oi=int(safe_number(ce.get("openInterest"))),
-                    pe_oi=int(safe_number(pe.get("openInterest"))),
-                    ce_chg_oi=int(safe_number(ce.get("changeinOpenInterest"))),
-                    pe_chg_oi=int(safe_number(pe.get("changeinOpenInterest"))),
-                    ce_volume=int(safe_number(ce.get("totalTradedVolume"))),
-                    pe_volume=int(safe_number(pe.get("totalTradedVolume"))),
-                    ce_iv=safe_number(ce.get("impliedVolatility")),
-                    pe_iv=safe_number(pe.get("impliedVolatility")),
+                    ce_ltp=safe_number(ce.get('lastPrice')),
+                    pe_ltp=safe_number(pe.get('lastPrice')),
+                    ce_change=safe_number(ce.get('change')),
+                    pe_change=safe_number(pe.get('change')),
+                    ce_oi=safe_int(ce.get('openInterest')),
+                    pe_oi=safe_int(pe.get('openInterest')),
+                    ce_chg_oi=safe_int(ce.get('changeinOpenInterest')),
+                    pe_chg_oi=safe_int(pe.get('changeinOpenInterest')),
+                    ce_volume=safe_int(ce.get('totalTradedVolume')),
+                    pe_volume=safe_int(pe.get('totalTradedVolume')),
+                    ce_iv=safe_number(ce.get('impliedVolatility')),
+                    pe_iv=safe_number(pe.get('impliedVolatility')),
                 )
             )
         except (TypeError, ValueError):
@@ -189,82 +205,206 @@ def nearest_strike_with_row(target: int, rows: list[OptionRow]) -> int:
     return min((row.strike for row in rows), key=lambda strike: abs(strike - target))
 
 
-def metric_max(candidates: list[dict[str, float]], key: str) -> float:
-    value = max((candidate.get(key, 0.0) for candidate in candidates), default=0.0)
+def zone_values(row: OptionRow, option_type: str) -> tuple[float, float, int, int, int, float]:
+    if option_type == 'PE':
+        return row.pe_ltp, row.pe_change, row.pe_oi, row.pe_chg_oi, row.pe_volume, row.pe_iv
+    return row.ce_ltp, row.ce_change, row.ce_oi, row.ce_chg_oi, row.ce_volume, row.ce_iv
+
+
+def metric_max(values: list[dict[str, object]], key: str) -> float:
+    value = max((safe_number(item.get(key)) for item in values), default=0.0)
     return value if value > 0 else 1.0
 
 
-def select_short_candidate(
-    rows: list[OptionRow],
-    option_type: str,
-    spot: float,
-    min_distance: int,
-    max_distance: int,
-    min_premium: float,
-) -> dict[str, object]:
-    candidates: list[dict[str, float]] = []
+def build_writing_zones(rows: list[OptionRow], option_type: str, spot: float) -> list[dict[str, object]]:
+    raw: list[dict[str, object]] = []
     for row in rows:
-        distance = spot - row.strike if option_type == "PE" else row.strike - spot
-        if distance < min_distance or distance > max_distance:
+        distance = spot - row.strike if option_type == 'PE' else row.strike - spot
+        if distance < 0:
             continue
-        ltp = row.pe_ltp if option_type == "PE" else row.ce_ltp
-        oi = row.pe_oi if option_type == "PE" else row.ce_oi
-        chg_oi = row.pe_chg_oi if option_type == "PE" else row.ce_chg_oi
-        volume = row.pe_volume if option_type == "PE" else row.ce_volume
-        iv = row.pe_iv if option_type == "PE" else row.ce_iv
-        if ltp < min_premium or oi <= 0:
+        ltp, change, oi, chg_oi, volume, iv = zone_values(row, option_type)
+        if oi <= 0 or ltp <= 0:
             continue
-        candidates.append(
+        raw.append(
             {
-                "strike": float(row.strike),
-                "ltp": ltp,
-                "oi": float(oi),
-                "chg_oi": float(max(0, chg_oi)),
-                "volume": float(volume),
-                "iv": iv,
-                "distance": float(distance),
+                'strike': row.strike,
+                'option_type': option_type,
+                'ltp': round(ltp, 2),
+                'change': round(change, 2),
+                'oi': oi,
+                'chg_oi': chg_oi,
+                'volume': volume,
+                'iv': round(iv, 2),
+                'distance': round(distance, 0),
             }
         )
 
-    if not candidates:
-        target = floor_to_step(spot - min_distance) if option_type == "PE" else ceil_to_step(spot + min_distance)
-        nearest = nearest_strike_with_row(target, rows)
-        row = row_index(rows).get(nearest)
-        return {
-            "strike": nearest,
-            "ltp": row.pe_ltp if row and option_type == "PE" else (row.ce_ltp if row else 0.0),
-            "oi": row.pe_oi if row and option_type == "PE" else (row.ce_oi if row else 0),
-            "chg_oi": row.pe_chg_oi if row and option_type == "PE" else (row.ce_chg_oi if row else 0),
-            "volume": row.pe_volume if row and option_type == "PE" else (row.ce_volume if row else 0),
-            "iv": row.pe_iv if row and option_type == "PE" else (row.ce_iv if row else 0.0),
-            "score": 0.0,
-            "reason": "Fallback nearest strike. Liquidity/premium did not clear selection screen.",
-        }
+    if not raw:
+        return []
 
-    max_oi = metric_max(candidates, "oi")
-    max_chg = metric_max(candidates, "chg_oi")
-    max_volume = metric_max(candidates, "volume")
-    max_ltp = metric_max(candidates, "ltp")
-    max_dist = metric_max(candidates, "distance")
-    best = None
-    best_score = -999.0
-    for candidate in candidates:
-        distance_penalty = candidate["distance"] / max_dist
-        score = (
-            0.36 * candidate["oi"] / max_oi
-            + 0.20 * candidate["chg_oi"] / max_chg
-            + 0.16 * candidate["volume"] / max_volume
-            + 0.28 * candidate["ltp"] / max_ltp
-            - 0.08 * distance_penalty
+    max_oi = metric_max(raw, 'oi')
+    max_chg = metric_max(raw, 'chg_oi')
+    max_volume = metric_max(raw, 'volume')
+    max_ltp = metric_max(raw, 'ltp')
+    max_distance = metric_max(raw, 'distance')
+    zones: list[dict[str, object]] = []
+    for item in raw:
+        chg_oi = safe_number(item.get('chg_oi'))
+        change = safe_number(item.get('change'))
+        if chg_oi > 0 and change <= 0:
+            signal = 'Fresh short buildup likely'
+            confidence = 'High'
+            writing_boost = 1.0
+        elif chg_oi > 0:
+            signal = 'Fresh OI buildup'
+            confidence = 'Medium'
+            writing_boost = 0.65
+        else:
+            signal = 'Existing OI wall'
+            confidence = 'Lower'
+            writing_boost = 0.25
+        distance_score = 1.0 - min(safe_number(item.get('distance')) / max_distance, 1.0)
+        score = 100 * (
+            0.34 * safe_number(item.get('oi')) / max_oi
+            + 0.24 * max(chg_oi, 0.0) / max_chg
+            + 0.14 * safe_number(item.get('volume')) / max_volume
+            + 0.10 * safe_number(item.get('ltp')) / max_ltp
+            + 0.12 * writing_boost
+            + 0.06 * distance_score
         )
-        if score > best_score:
-            best_score = score
-            best = candidate
-    assert best is not None
-    best["strike"] = int(best["strike"])
-    best["score"] = round(best_score, 3)
-    best["reason"] = "Selected by OI, positive OI change, volume, premium, and distance buffer."
-    return best
+        item['score'] = round(score, 1)
+        item['signal'] = signal
+        item['confidence'] = confidence
+        zones.append(item)
+    return sorted(zones, key=lambda item: (safe_number(item.get('score')), safe_number(item.get('chg_oi')), safe_number(item.get('oi'))), reverse=True)
+
+
+def build_writer_map(rows: list[OptionRow], spot: float, expiry: date) -> dict[str, object]:
+    puts = build_writing_zones(rows, 'PE', spot)
+    calls = build_writing_zones(rows, 'CE', spot)
+    total_pe_oi = sum(row.pe_oi for row in rows)
+    total_ce_oi = sum(row.ce_oi for row in rows)
+    pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 0.0
+    support = puts[0]['strike'] if puts else None
+    resistance = calls[0]['strike'] if calls else None
+    if support and resistance:
+        writer_range = f'{support} to {resistance}'
+    else:
+        writer_range = 'Not enough live OI'
+    if pcr >= 1.2:
+        bias = 'Put writers heavier'
+    elif pcr <= 0.8 and pcr > 0:
+        bias = 'Call writers heavier'
+    else:
+        bias = 'Balanced writers'
+    return {
+        'expiry': expiry.isoformat(),
+        'puts': puts[:8],
+        'calls': calls[:8],
+        'support': support,
+        'resistance': resistance,
+        'writer_range': writer_range,
+        'pcr': pcr,
+        'bias': bias,
+        'total_pe_oi': total_pe_oi,
+        'total_ce_oi': total_ce_oi,
+    }
+
+
+def clean_cell(value: object) -> str:
+    return str(value or '').strip().replace('\ufeff', '')
+
+
+def parse_participant_oi(text: str, day: date) -> dict[str, object] | None:
+    rows = list(csv.reader(io.StringIO(text)))
+    header_index = None
+    for index, row in enumerate(rows):
+        if row and clean_cell(row[0]).lower() == 'client type':
+            header_index = index
+            break
+    if header_index is None:
+        return None
+    headers = [clean_cell(cell) for cell in rows[header_index]]
+    lookup = {name: pos for pos, name in enumerate(headers)}
+
+    def get_value(row: list[str], name: str) -> int:
+        pos = lookup.get(name)
+        if pos is None or pos >= len(row):
+            return 0
+        return safe_int(row[pos])
+
+    parsed: dict[str, dict[str, int]] = {}
+    for row in rows[header_index + 1:]:
+        if not row:
+            continue
+        label = clean_cell(row[0]).upper()
+        if label in ('CLIENT', 'DII', 'FII', 'PRO'):
+            parsed[label] = {
+                'future_index_long': get_value(row, 'Future Index Long'),
+                'future_index_short': get_value(row, 'Future Index Short'),
+                'call_long': get_value(row, 'Option Index Call Long'),
+                'call_short': get_value(row, 'Option Index Call Short'),
+                'put_long': get_value(row, 'Option Index Put Long'),
+                'put_short': get_value(row, 'Option Index Put Short'),
+            }
+    if not parsed:
+        return None
+
+    rows_out: list[dict[str, object]] = []
+    for label in ('FII', 'PRO', 'CLIENT', 'DII'):
+        item = parsed.get(label)
+        if not item:
+            continue
+        rows_out.append(
+            {
+                'client_type': label,
+                'future_net': item['future_index_long'] - item['future_index_short'],
+                'call_short': item['call_short'],
+                'put_short': item['put_short'],
+                'call_net': item['call_long'] - item['call_short'],
+                'put_net': item['put_long'] - item['put_short'],
+            }
+        )
+
+    smart_call_short = sum(parsed.get(label, {}).get('call_short', 0) for label in ('FII', 'PRO'))
+    smart_put_short = sum(parsed.get(label, {}).get('put_short', 0) for label in ('FII', 'PRO'))
+    smart_future_net = sum(parsed.get(label, {}).get('future_index_long', 0) - parsed.get(label, {}).get('future_index_short', 0) for label in ('FII', 'PRO'))
+    if smart_call_short > smart_put_short * 1.15:
+        bias = 'FII + PRO index call shorts heavier'
+    elif smart_put_short > smart_call_short * 1.15:
+        bias = 'FII + PRO index put shorts heavier'
+    else:
+        bias = 'FII + PRO index option shorts balanced'
+    return {
+        'date': day.isoformat(),
+        'rows': rows_out,
+        'summary': {
+            'smart_call_short': smart_call_short,
+            'smart_put_short': smart_put_short,
+            'smart_future_net': smart_future_net,
+            'bias': bias,
+        },
+        'note': 'Participant OI is EOD and category-level across index derivatives. It is not strike-specific.',
+    }
+
+
+def fetch_participant_oi() -> dict[str, object] | None:
+    session = requests.Session()
+    session.headers.update(nse_headers())
+    for offset in range(0, 12):
+        day = today_ist() - timedelta(days=offset)
+        stamp = day.strftime('%d%m%Y')
+        url = NSE_PARTICIPANT_URL.format(stamp=stamp)
+        try:
+            response = session.get(url, timeout=12)
+            if response.status_code != 200 or 'Client Type' not in response.text:
+                continue
+            parsed = parse_participant_oi(response.text, day)
+            if parsed:
+                return parsed
+        except requests.RequestException:
+            continue
+    return None
 
 
 def build_leg(side: str, row: OptionRow | None, strike: int, option_type: str, expiry: date) -> dict[str, object]:
@@ -273,199 +413,317 @@ def build_leg(side: str, row: OptionRow | None, strike: int, option_type: str, e
         oi = 0
         volume = 0
         iv = 0.0
-    elif option_type == "PE":
+    elif option_type == 'PE':
         ltp, oi, volume, iv = row.pe_ltp, row.pe_oi, row.pe_volume, row.pe_iv
     else:
         ltp, oi, volume, iv = row.ce_ltp, row.ce_oi, row.ce_volume, row.ce_iv
+    expiry_label = expiry.strftime('%d-%b-%Y').upper()
     return {
-        "side": side,
-        "strike": strike,
-        "type": option_type,
-        "expiry": expiry.isoformat(),
-        "symbol": f"NIFTY {expiry.strftime('%d-%b-%Y').upper()} {strike}{option_type}",
-        "ltp": round(float(ltp), 2),
-        "oi": int(oi),
-        "volume": int(volume),
-        "iv": round(float(iv), 2),
+        'side': side,
+        'strike': strike,
+        'type': option_type,
+        'expiry': expiry.isoformat(),
+        'symbol': f'NIFTY {expiry_label} {strike}{option_type}',
+        'ltp': round(float(ltp), 2),
+        'oi': int(oi),
+        'volume': int(volume),
+        'iv': round(float(iv), 2),
     }
 
 
 def estimate_values(plan: dict[str, object]) -> None:
-    legs = plan["legs"]
-    credit = sum(float(leg["ltp"]) for leg in legs if leg["side"] == "SELL") - sum(
-        float(leg["ltp"]) for leg in legs if leg["side"] == "BUY"
+    legs = plan.get('legs', [])
+    if not isinstance(legs, list):
+        legs = []
+    credit = sum(safe_number(leg.get('ltp')) for leg in legs if isinstance(leg, dict) and leg.get('side') == 'SELL') - sum(
+        safe_number(leg.get('ltp')) for leg in legs if isinstance(leg, dict) and leg.get('side') == 'BUY'
     )
-    wing = int(plan["wing_width"])
-    lot_size = int(plan["lot_size"])
+    wing = safe_int(plan.get('wing_width'))
+    lot_size = safe_int(plan.get('lot_size'), NIFTY_LOT_SIZE)
     max_risk_per_lot = max(0.0, (wing - credit) * lot_size)
-    target_per_lot = credit * lot_size * float(plan["target_capture"])
-    stop_per_lot = credit * lot_size * float(plan["stop_multiple"])
+    target_per_lot = credit * lot_size * safe_number(plan.get('target_capture'))
+    stop_per_lot = credit * lot_size * safe_number(plan.get('stop_multiple'))
     reward_to_risk = 0.0 if max_risk_per_lot <= 0 else target_per_lot / max_risk_per_lot
-    risk_budget = float(plan["capital"]) * float(plan["risk_pct"])
+    risk_budget = safe_number(plan.get('capital')) * safe_number(plan.get('risk_pct'))
+    lot_capacity = 0 if max_risk_per_lot <= 0 else min(safe_int(plan.get('max_lots')), int(risk_budget // max_risk_per_lot))
 
-    forced_lots = 1 if max_risk_per_lot <= 0 else max(1, min(int(plan["max_lots"]), int(risk_budget // max_risk_per_lot)))
-    credit_ok = credit >= float(plan["min_credit"])
-    target_ok = target_per_lot >= float(plan["min_target_per_lot"])
-    rr_ok = reward_to_risk >= float(plan["min_reward_to_risk"])
-    source_ok = plan["source"] == "NSE"
-    prices_ok = all(float(leg["ltp"]) > 0 for leg in legs)
-    trade_ok = credit_ok and target_ok and rr_ok and source_ok and prices_ok and forced_lots > 0
+    min_credit = safe_number(plan.get('min_credit'))
+    min_target = safe_number(plan.get('min_target_per_lot'))
+    min_rr = safe_number(plan.get('min_reward_to_risk'))
+    source_ok = plan.get('source') == 'NSE'
+    prices_ok = bool(legs) and all(isinstance(leg, dict) and safe_number(leg.get('ltp')) > 0 for leg in legs)
+    credit_ok = credit >= min_credit
+    target_ok = target_per_lot >= min_target
+    rr_ok = reward_to_risk >= min_rr
+    trade_ok = source_ok and prices_ok and credit_ok and target_ok and rr_ok and lot_capacity > 0
 
-    reasons = []
+    reasons: list[str] = []
     if not source_ok:
-        reasons.append("source is SAMPLE, not live NSE")
+        reasons.append('live NSE data is unavailable')
     if not prices_ok:
-        reasons.append("one or more leg prices are missing")
+        reasons.append('one or more live leg prices are missing')
     if not credit_ok:
-        reasons.append(f"credit {credit:.2f} is below required {float(plan['min_credit']):.2f}")
+        reasons.append(f'credit {credit:.2f} is below required {min_credit:.2f}')
     if not target_ok:
-        reasons.append(f"target/lot INR {target_per_lot:.0f} is below required INR {float(plan['min_target_per_lot']):.0f}")
+        reasons.append(f'target per lot INR {target_per_lot:.0f} is below required INR {min_target:.0f}')
     if not rr_ok:
-        reasons.append(f"target-to-risk {reward_to_risk * 100:.1f}% is below required {float(plan['min_reward_to_risk']) * 100:.1f}%")
-    if forced_lots <= 0:
-        reasons.append("risk budget does not support even one lot")
+        reasons.append(f'target to max-risk {reward_to_risk * 100:.1f}% is below required {min_rr * 100:.1f}%')
+    if lot_capacity <= 0:
+        reasons.append('risk budget does not support one lot')
 
-    plan["suggested_lots"] = forced_lots if trade_ok else 0
-    plan["net_credit"] = round(credit, 2)
-    plan["max_risk"] = round(max_risk_per_lot * (forced_lots if trade_ok else 1), 0)
-    plan["target_profit"] = round(target_per_lot * (forced_lots if trade_ok else 1), 0)
-    plan["stop_loss"] = round(stop_per_lot * (forced_lots if trade_ok else 1), 0)
-    plan["risk_budget"] = round(risk_budget, 0)
-    plan["credit_ok"] = credit_ok
-    plan["target_ok"] = target_ok
-    plan["reward_to_risk"] = round(reward_to_risk, 4)
-    plan["reward_to_risk_pct"] = round(reward_to_risk * 100, 1)
-    plan["trade_ok"] = trade_ok
-    plan["decision"] = "TRADE CANDIDATE" if trade_ok else "NO TRADE"
-    plan["decision_reason"] = "; ".join(reasons) if reasons else "All hard gates passed. Still verify broker margin, spread, and event risk."
-    plan["metric_scope"] = "selected lots" if trade_ok else "1-lot watchlist only"
+    shown_lots = lot_capacity if trade_ok else 1
+    plan['suggested_lots'] = lot_capacity if trade_ok else 0
+    plan['net_credit'] = round(credit, 2)
+    plan['max_risk'] = round(max_risk_per_lot * shown_lots, 0)
+    plan['target_profit'] = round(target_per_lot * shown_lots, 0)
+    plan['stop_loss'] = round(stop_per_lot * shown_lots, 0)
+    plan['risk_budget'] = round(risk_budget, 0)
+    plan['credit_ok'] = credit_ok
+    plan['target_ok'] = target_ok
+    plan['reward_to_risk'] = round(reward_to_risk, 4)
+    plan['reward_to_risk_pct'] = round(reward_to_risk * 100, 1)
+    plan['trade_ok'] = trade_ok
+    plan['decision'] = 'TRADE CANDIDATE' if trade_ok else 'NO TRADE'
+    plan['decision_reason'] = '; '.join(reasons) if reasons else 'All hard gates passed. Verify broker margin, spreads, and event risk before order entry.'
+    plan['metric_scope'] = 'selected lots' if trade_ok else '1-lot rejection view'
+
+
+def leg_command(prefix: str, leg: dict[str, object], lots: int) -> str:
+    strike = leg.get('strike')
+    option_type = leg.get('type')
+    return f'{prefix} {lots} lot {strike} {option_type}'
 
 
 def trade_line(plan: dict[str, object]) -> str:
-    lots = plan.get("suggested_lots", 0)
-    shown_lots = lots if lots and lots > 0 else 1
-    sell_legs = [leg for leg in plan["legs"] if leg["side"] == "SELL"]
-    buy_legs = [leg for leg in plan["legs"] if leg["side"] == "BUY"]
-    sell_text = " + ".join(f"SELL {shown_lots} lot {leg['strike']} {leg['type']}" for leg in sell_legs)
-    buy_text = " + ".join(f"BUY {shown_lots} lot {leg['strike']} {leg['type']}" for leg in buy_legs)
-    if lots and lots > 0:
-        return f"{sell_text}; hedge with {buy_text}"
-    return f"NO TRADE. Watchlist only: {sell_text}; hedge with {buy_text}"
+    legs = plan.get('legs', [])
+    if not isinstance(legs, list) or not legs:
+        return 'NO TRADE. Live option rows unavailable for this expiry.'
+    lots = safe_int(plan.get('suggested_lots'))
+    shown_lots = lots if lots > 0 else 1
+    sell_legs = [leg for leg in legs if isinstance(leg, dict) and leg.get('side') == 'SELL']
+    buy_legs = [leg for leg in legs if isinstance(leg, dict) and leg.get('side') == 'BUY']
+    sell_text = ' + '.join(leg_command('SELL', leg, shown_lots) for leg in sell_legs)
+    buy_text = ' + '.join(leg_command('BUY', leg, shown_lots) for leg in buy_legs)
+    if lots > 0:
+        return f'{sell_text}; hedge with {buy_text}'
+    return f'NO TRADE. Watch zones only: {sell_text}; hedge with {buy_text}'
 
 
-def build_action_plan(kind: str, spot: float, expiry: date, rows: list[OptionRow], source: str) -> dict[str, object]:
-    base = today_ist()
-    if kind == "weekly":
-        min_distance = max(300, ceil_to_step(spot * 0.018))
-        max_distance = max(900, ceil_to_step(spot * 0.055))
-        min_premium = 8.0
-        wing = 300
-        capital = 400000
-        risk_pct = 0.06
-        max_lots = 3
-        target_capture = 0.55
-        stop_multiple = 1.75
-        min_credit_ratio = 0.20
-        min_target_per_lot = 1500
-        min_reward_to_risk = 0.08
-        title = "Weekly OI-Supported Iron Condor"
-        entry_filter = "Use after the first 30-45 minutes only if hard gates pass and spot remains comfortably between short strikes."
-    else:
-        min_distance = max(650, ceil_to_step(spot * 0.04))
-        max_distance = max(1900, ceil_to_step(spot * 0.10))
-        min_premium = 15.0
-        wing = 500
-        capital = 400000
-        risk_pct = 0.045
-        max_lots = 2
-        target_capture = 0.60
-        stop_multiple = 1.90
-        min_credit_ratio = 0.18
-        min_target_per_lot = 2500
-        min_reward_to_risk = 0.07
-        title = "Monthly OI-Supported Wide Iron Condor"
-        entry_filter = "Prefer entry when VIX/IV is elevated but cooling. Avoid budget, RBI, election, CPI/Fed, or major event weeks."
+def zone_pool(zones: list[dict[str, object]], min_distance: int, max_distance: int, min_premium: float) -> list[dict[str, object]]:
+    pool = [
+        zone
+        for zone in zones
+        if min_distance <= safe_number(zone.get('distance')) <= max_distance and safe_number(zone.get('ltp')) >= min_premium
+    ]
+    if len(pool) >= 4:
+        return pool[:12]
+    seen = {safe_int(zone.get('strike')) for zone in pool}
+    for zone in zones:
+        strike = safe_int(zone.get('strike'))
+        if strike in seen:
+            continue
+        if safe_number(zone.get('distance')) >= min_distance:
+            pool.append(zone)
+            seen.add(strike)
+        if len(pool) >= 12:
+            break
+    return pool[:12]
 
-    index = row_index(rows)
-    pe_short = select_short_candidate(rows, "PE", spot, min_distance, max_distance, min_premium)
-    ce_short = select_short_candidate(rows, "CE", spot, min_distance, max_distance, min_premium)
-    pe_short_strike = int(pe_short["strike"])
-    ce_short_strike = int(ce_short["strike"])
-    pe_buy_strike = nearest_strike_with_row(pe_short_strike - wing, rows)
-    ce_buy_strike = nearest_strike_with_row(ce_short_strike + wing, rows)
 
+def no_trade_plan(kind: str, title: str, expiry: date, source: str, reason: str, params: dict[str, object]) -> dict[str, object]:
     plan = {
-        "kind": kind,
-        "title": title,
-        "source": source,
-        "expiry": expiry.isoformat(),
-        "dte": (expiry - base).days,
-        "spot": round(spot, 2),
-        "capital": capital,
-        "risk_pct": risk_pct,
-        "max_lots": max_lots,
-        "lot_size": NIFTY_LOT_SIZE,
-        "wing_width": wing,
-        "target_capture": target_capture,
-        "stop_multiple": stop_multiple,
-        "min_credit": round(wing * min_credit_ratio, 2),
-        "min_target_per_lot": min_target_per_lot,
-        "min_reward_to_risk": min_reward_to_risk,
-        "legs": [
-            build_leg("SELL", index.get(pe_short_strike), pe_short_strike, "PE", expiry),
-            build_leg("SELL", index.get(ce_short_strike), ce_short_strike, "CE", expiry),
-            build_leg("BUY", index.get(pe_buy_strike), pe_buy_strike, "PE", expiry),
-            build_leg("BUY", index.get(ce_buy_strike), ce_buy_strike, "CE", expiry),
-        ],
-        "entry_filter": entry_filter,
-        "invalid_if": "Skip if spot is within 150 points of either short strike, if selected short-side OI starts unwinding sharply, if bid-ask spread is wide, or if any hard gate fails.",
-        "exit_plan": "Book 50-60% credit capture. Exit if combined spread loss reaches the stop reference or if spot closes beyond a short strike buffer.",
-        "selection_reason": f"PE: {pe_short['reason']} CE: {ce_short['reason']}",
-        "suggested_lots": 0,
-        "net_credit": None,
-        "max_risk": None,
-        "target_profit": None,
-        "stop_loss": None,
-        "trade_ok": False,
-        "decision": "NO TRADE",
-        "decision_reason": "Not evaluated yet.",
+        'kind': kind,
+        'title': title,
+        'source': source,
+        'expiry': expiry.isoformat(),
+        'dte': (expiry - today_ist()).days,
+        'spot': 0,
+        'capital': params['capital'],
+        'risk_pct': params['risk_pct'],
+        'max_lots': params['max_lots'],
+        'lot_size': NIFTY_LOT_SIZE,
+        'wing_width': params['wing'],
+        'target_capture': params['target_capture'],
+        'stop_multiple': params['stop_multiple'],
+        'min_credit': params['min_credit'],
+        'min_target_per_lot': params['min_target_per_lot'],
+        'min_reward_to_risk': params['min_reward_to_risk'],
+        'legs': [],
+        'entry_filter': params['entry_filter'],
+        'invalid_if': params['invalid_if'],
+        'exit_plan': params['exit_plan'],
+        'selection_reason': reason,
+        'suggested_lots': 0,
+        'net_credit': 0,
+        'max_risk': 0,
+        'target_profit': 0,
+        'stop_loss': 0,
+        'reward_to_risk_pct': 0,
+        'metric_scope': 'no live candidate',
+        'trade_ok': False,
+        'decision': 'NO TRADE',
+        'decision_reason': reason,
+        'trade_line': 'NO TRADE. No live candidate cleared the data screen.',
+        'rank_score': 0,
     }
-    estimate_values(plan)
-    plan["trade_line"] = trade_line(plan)
     return plan
 
 
-def sample_payload() -> tuple[float, str, list[date], list[OptionRow]]:
-    base = today_ist()
-    weekly = next_tuesday(base)
-    monthly = fallback_monthly_expiry(base)
-    spot = 24500.0
-    rows: list[OptionRow] = []
-    for expiry in [weekly, monthly]:
-        for strike in range(22000, 27050, 50):
-            distance = abs(strike - spot)
-            base_premium = max(4.0, 120.0 - distance * 0.11)
-            ce_ltp = round(base_premium if strike >= spot else base_premium + (spot - strike), 2)
-            pe_ltp = round(base_premium if strike <= spot else base_premium + (strike - spot), 2)
-            ce_oi = max(50, int(9000 - abs(strike - 25500) * 8)) if strike >= spot else max(50, int(2200 - distance * 2))
-            pe_oi = max(50, int(9000 - abs(strike - 23500) * 8)) if strike <= spot else max(50, int(2200 - distance * 2))
-            rows.append(
-                OptionRow(
-                    expiry=expiry,
-                    strike=strike,
-                    ce_ltp=ce_ltp,
-                    pe_ltp=pe_ltp,
-                    ce_oi=ce_oi,
-                    pe_oi=pe_oi,
-                    ce_chg_oi=max(0, ce_oi // 8),
-                    pe_chg_oi=max(0, pe_oi // 8),
-                    ce_volume=max(10, ce_oi // 5),
-                    pe_volume=max(10, pe_oi // 5),
-                    ce_iv=13.5,
-                    pe_iv=14.0,
-                )
-            )
-    return spot, now_ist_label(), [weekly, monthly], rows
+def build_pair_plan(kind: str, title: str, spot: float, expiry: date, rows: list[OptionRow], source: str, pe_zone: dict[str, object], ce_zone: dict[str, object], params: dict[str, object]) -> dict[str, object]:
+    index = row_index(rows)
+    wing = safe_int(params['wing'])
+    pe_short = safe_int(pe_zone.get('strike'))
+    ce_short = safe_int(ce_zone.get('strike'))
+    pe_buy = nearest_strike_with_row(pe_short - wing, rows)
+    ce_buy = nearest_strike_with_row(ce_short + wing, rows)
+    plan = {
+        'kind': kind,
+        'title': title,
+        'source': source,
+        'expiry': expiry.isoformat(),
+        'dte': (expiry - today_ist()).days,
+        'spot': round(spot, 2),
+        'capital': params['capital'],
+        'risk_pct': params['risk_pct'],
+        'max_lots': params['max_lots'],
+        'lot_size': NIFTY_LOT_SIZE,
+        'wing_width': wing,
+        'target_capture': params['target_capture'],
+        'stop_multiple': params['stop_multiple'],
+        'min_credit': params['min_credit'],
+        'min_target_per_lot': params['min_target_per_lot'],
+        'min_reward_to_risk': params['min_reward_to_risk'],
+        'legs': [
+            build_leg('SELL', index.get(pe_short), pe_short, 'PE', expiry),
+            build_leg('SELL', index.get(ce_short), ce_short, 'CE', expiry),
+            build_leg('BUY', index.get(pe_buy), pe_buy, 'PE', expiry),
+            build_leg('BUY', index.get(ce_buy), ce_buy, 'CE', expiry),
+        ],
+        'entry_filter': params['entry_filter'],
+        'invalid_if': params['invalid_if'],
+        'exit_plan': params['exit_plan'],
+        'selection_reason': f'PE writer zone {pe_short}: {pe_zone.get('signal')} score {pe_zone.get('score')}. CE writer zone {ce_short}: {ce_zone.get('signal')} score {ce_zone.get('score')}.',
+        'short_pe_score': pe_zone.get('score'),
+        'short_ce_score': ce_zone.get('score'),
+    }
+    estimate_values(plan)
+    credit_ratio = min(safe_number(plan.get('net_credit')) / max(safe_number(plan.get('min_credit')), 1.0), 2.0)
+    rr_ratio = min(safe_number(plan.get('reward_to_risk')) / max(safe_number(plan.get('min_reward_to_risk')), 0.01), 2.0)
+    zone_score = (safe_number(pe_zone.get('score')) + safe_number(ce_zone.get('score'))) / 200
+    distance_balance = min(safe_number(pe_zone.get('distance')), safe_number(ce_zone.get('distance'))) / max(safe_number(pe_zone.get('distance')), safe_number(ce_zone.get('distance')), 1.0)
+    pass_bonus = 2.5 if plan.get('trade_ok') else 0.0
+    plan['rank_score'] = round(pass_bonus + 0.9 * credit_ratio + 0.7 * rr_ratio + 1.1 * zone_score + 0.4 * distance_balance, 3)
+    plan['trade_line'] = trade_line(plan)
+    return plan
+
+
+def strategy_params(kind: str) -> tuple[str, dict[str, object]]:
+    if kind == 'weekly':
+        wing = 300
+        target_capture = 0.55
+        min_target = 1500
+        title = 'Weekly Writer-Zone Iron Condor'
+        params = {
+            'capital': 400000,
+            'risk_pct': 0.06,
+            'max_lots': 3,
+            'wing': wing,
+            'target_capture': target_capture,
+            'stop_multiple': 1.75,
+            'min_credit_ratio': 0.14,
+            'min_target_per_lot': min_target,
+            'min_reward_to_risk': 0.08,
+            'min_distance_floor': 250,
+            'max_distance_floor': 1000,
+            'distance_pct': 0.011,
+            'max_distance_pct': 0.05,
+            'min_premium': 8.0,
+            'entry_filter': 'Use after first 30-45 minutes only if spot stays between writer zones and breadth is not one-way trending.',
+            'invalid_if': 'Skip if spot is within 150 points of either short strike, OI starts unwinding, spreads are wide, or any hard gate fails.',
+            'exit_plan': 'Book 50-60% credit capture. Cut if combined spread loss hits stop reference or spot closes beyond short-strike buffer.',
+        }
+    else:
+        wing = 500
+        target_capture = 0.60
+        min_target = 2500
+        title = 'Monthly Writer-Zone Wide Iron Condor'
+        params = {
+            'capital': 400000,
+            'risk_pct': 0.045,
+            'max_lots': 2,
+            'wing': wing,
+            'target_capture': target_capture,
+            'stop_multiple': 1.9,
+            'min_credit_ratio': 0.15,
+            'min_target_per_lot': min_target,
+            'min_reward_to_risk': 0.07,
+            'min_distance_floor': 600,
+            'max_distance_floor': 2200,
+            'distance_pct': 0.03,
+            'max_distance_pct': 0.1,
+            'min_premium': 15.0,
+            'entry_filter': 'Prefer entry when IV is elevated but cooling. Avoid budget, RBI, election, CPI/Fed, or major event windows.',
+            'invalid_if': 'Skip if one side is too close to spot, net credit is thin, OI wall is not fresh, or hedge liquidity is poor.',
+            'exit_plan': 'Book 50-60% credit capture or reduce when one short side loses writer support.',
+        }
+    min_credit_by_target = min_target / max(NIFTY_LOT_SIZE * target_capture, 1)
+    params['min_credit'] = round(max(wing * safe_number(params['min_credit_ratio']), min_credit_by_target), 2)
+    return title, params
+
+
+def build_action_plan(kind: str, spot: float, expiry: date, rows: list[OptionRow], source: str) -> dict[str, object]:
+    title, params = strategy_params(kind)
+    if not rows:
+        return no_trade_plan(kind, title, expiry, source, 'No live option rows available for this expiry.', params)
+    pe_zones = build_writing_zones(rows, 'PE', spot)
+    ce_zones = build_writing_zones(rows, 'CE', spot)
+    min_distance = max(safe_int(params['min_distance_floor']), ceil_to_step(spot * safe_number(params['distance_pct'])))
+    max_distance = max(safe_int(params['max_distance_floor']), ceil_to_step(spot * safe_number(params['max_distance_pct'])))
+    pe_pool = zone_pool(pe_zones, min_distance, max_distance, safe_number(params['min_premium']))
+    ce_pool = zone_pool(ce_zones, min_distance, max_distance, safe_number(params['min_premium']))
+    if not pe_pool or not ce_pool:
+        return no_trade_plan(kind, title, expiry, source, 'No put/call writer-zone pair has enough distance and live premium.', params)
+
+    candidates: list[dict[str, object]] = []
+    for pe_zone in pe_pool:
+        for ce_zone in ce_pool:
+            if safe_int(pe_zone.get('strike')) >= safe_int(ce_zone.get('strike')):
+                continue
+            candidates.append(build_pair_plan(kind, title, spot, expiry, rows, source, pe_zone, ce_zone, params))
+    if not candidates:
+        return no_trade_plan(kind, title, expiry, source, 'No valid support/resistance pair could be formed from live writer zones.', params)
+    passing = [plan for plan in candidates if plan.get('trade_ok')]
+    if passing:
+        return max(passing, key=lambda plan: safe_number(plan.get('rank_score')))
+    return max(candidates, key=lambda plan: safe_number(plan.get('rank_score')))
+
+
+def unavailable_board(error: str) -> dict[str, object]:
+    return {
+        'source': 'UNAVAILABLE',
+        'data_ok': False,
+        'status': f'Live NSE option-chain refresh failed. No sample trades are generated. Error: {error}',
+        'spot': 0,
+        'as_of': '-',
+        'server_refreshed_at': now_ist_label(),
+        'cache_seconds': CACHE_SECONDS,
+        'lot_size': NIFTY_LOT_SIZE,
+        'zones': {
+            'expiry': '-',
+            'puts': [],
+            'calls': [],
+            'support': None,
+            'resistance': None,
+            'writer_range': 'Unavailable',
+            'pcr': 0,
+            'bias': 'Unavailable',
+            'total_pe_oi': 0,
+            'total_ce_oi': 0,
+        },
+        'participant': None,
+        'plans': [],
+        'stale': False,
+    }
 
 
 def load_action_board_uncached() -> dict[str, object]:
@@ -474,214 +732,251 @@ def load_action_board_uncached() -> dict[str, object]:
         payload = fetch_nse_option_chain()
         spot, timestamp, expiries, rows = parse_chain(payload)
         if spot <= 0 or not rows:
-            raise ValueError("NSE option chain returned no usable rows")
+            raise ValueError('NSE option chain returned no usable rows')
         weekly_expiry, monthly_expiry = choose_expiries(expiries, base)
-        source = "NSE"
-        status = "Public NSE option-chain data. Broker token not required. Cached server-side."
-    except Exception as exc:  # noqa: BLE001 - public NSE can rate-limit/cloud-block hosted apps
-        stale = _CACHE.get("board")
-        if isinstance(stale, dict) and stale.get("source") == "NSE":
-            stale = dict(stale)
-            stale["status"] = f"NSE refresh failed, showing last cached board. Error: {exc}"
-            return stale
-        spot, timestamp, expiries, rows = sample_payload()
-        weekly_expiry, monthly_expiry = choose_expiries(expiries, base)
-        source = "SAMPLE"
-        status = f"NSE refresh failed and no cache exists, showing SAMPLE no-trade board. Error: {exc}"
+    except Exception as exc:  # noqa: BLE001 - NSE can block hosted traffic intermittently
+        stale = _CACHE.get('board')
+        if isinstance(stale, dict) and stale.get('source') == 'NSE':
+            copy = dict(stale)
+            copy['stale'] = True
+            copy['status'] = f'NSE refresh failed, showing last cached live board. Error: {exc}'
+            copy['server_refreshed_at'] = now_ist_label()
+            return copy
+        return unavailable_board(str(exc))
 
     weekly_rows = rows_for_expiry(rows, weekly_expiry)
     monthly_rows = rows_for_expiry(rows, monthly_expiry)
+    zones = build_writer_map(weekly_rows, spot, weekly_expiry)
+    participant = fetch_participant_oi()
     plans = [
-        build_action_plan("weekly", spot, weekly_expiry, weekly_rows, source),
-        build_action_plan("monthly", spot, monthly_expiry, monthly_rows, source),
+        build_action_plan('weekly', spot, weekly_expiry, weekly_rows, 'NSE'),
+        build_action_plan('monthly', spot, monthly_expiry, monthly_rows, 'NSE'),
     ]
     return {
-        "source": source,
-        "status": status,
-        "spot": round(spot, 2),
-        "as_of": timestamp,
-        "server_refreshed_at": now_ist_label(),
-        "cache_seconds": CACHE_SECONDS,
-        "lot_size": NIFTY_LOT_SIZE,
-        "plans": plans,
+        'source': 'NSE',
+        'data_ok': True,
+        'status': 'Live NSE option-chain writer map. Broker token not required. Strike-level FII identity is not public; zones use OI/OI-change proxy.',
+        'spot': round(spot, 2),
+        'as_of': timestamp,
+        'server_refreshed_at': now_ist_label(),
+        'cache_seconds': CACHE_SECONDS,
+        'lot_size': NIFTY_LOT_SIZE,
+        'zones': zones,
+        'participant': participant,
+        'plans': plans,
+        'stale': False,
     }
 
 
 def load_action_board() -> dict[str, object]:
-    expires_at = _CACHE.get("expires_at")
-    if isinstance(expires_at, datetime) and expires_at > now_ist() and isinstance(_CACHE.get("board"), dict):
-        return _CACHE["board"]  # type: ignore[return-value]
+    expires_at = _CACHE.get('expires_at')
+    if isinstance(expires_at, datetime) and expires_at > now_ist() and isinstance(_CACHE.get('board'), dict):
+        return _CACHE['board']  # type: ignore[return-value]
     board = load_action_board_uncached()
-    _CACHE["board"] = board
-    _CACHE["expires_at"] = now_ist() + timedelta(seconds=CACHE_SECONDS)
+    _CACHE['board'] = board
+    _CACHE['expires_at'] = now_ist() + timedelta(seconds=CACHE_SECONDS)
     return board
 
 
-PAGE = """
+PAGE = '''
 <!doctype html>
-<html lang="en">
+<html lang='en'>
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="300">
-  <title>NIFTY Options Action Board</title>
+  <meta charset='utf-8'>
+  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <meta http-equiv='refresh' content='300'>
+  <title>NIFTY Writer Map</title>
   <style>
-    :root { --ink:#172026; --muted:#59656f; --line:#d7dde2; --panel:#ffffff; --page:#f4f7f5; --green:#0f7a55; --amber:#b7791f; --red:#b42318; --teal:#0e7490; }
-    * { box-sizing: border-box; }
-    body { margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:var(--ink); background:var(--page); }
-    header { border-bottom:1px solid var(--line); background:#fbfcfb; }
-    .wrap { width:min(1180px, calc(100vw - 32px)); margin:0 auto; }
-    .topbar { display:flex; align-items:center; justify-content:space-between; gap:20px; padding:18px 0; }
+    :root { --ink:#18212a; --muted:#5e6a74; --line:#d7dee4; --page:#f4f7f5; --panel:#ffffff; --green:#08744f; --red:#b42318; --amber:#b7791f; --blue:#0e7490; --dark:#101820; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; color:var(--ink); background:var(--page); }
+    header { background:#fbfcfb; border-bottom:1px solid var(--line); }
+    .wrap { width:min(1240px, calc(100vw - 32px)); margin:0 auto; }
+    .topbar { display:flex; align-items:center; justify-content:space-between; gap:18px; padding:16px 0; }
     .brand { display:flex; align-items:center; gap:12px; min-width:0; }
     .mark { width:38px; height:38px; border:2px solid var(--green); display:grid; place-items:center; font-weight:800; color:var(--green); }
     h1 { margin:0; font-size:20px; line-height:1.2; letter-spacing:0; }
-    .brand span, .muted { color:var(--muted); font-size:13px; }
-    .status { display:flex; align-items:center; gap:9px; padding:8px 11px; border:1px solid var(--line); background:#fff; font-size:13px; max-width:520px; }
+    h2 { margin:0 0 12px; font-size:16px; letter-spacing:0; }
+    h3 { margin:0 0 5px; font-size:15px; letter-spacing:0; }
+    .sub, .muted { color:var(--muted); font-size:13px; }
+    .status { display:flex; align-items:center; gap:9px; padding:8px 11px; border:1px solid var(--line); background:#fff; font-size:13px; max-width:560px; }
     .dot { width:9px; height:9px; border-radius:99px; background:var(--green); flex:0 0 auto; }
-    .dot.sample { background:var(--amber); }
-    main { padding:26px 0 40px; }
-    .hero { display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap:10px; margin-bottom:18px; }
-    .kpi, .panel, .action { background:var(--panel); border:1px solid var(--line); border-radius:8px; }
-    .kpi { padding:14px; min-height:86px; }
-    .kpi b { display:block; font-size:23px; margin-bottom:6px; }
-    .grid { display:grid; grid-template-columns: 1.35fr .85fr; gap:18px; align-items:start; }
-    .section { padding:18px; }
+    .dot.bad { background:var(--red); }
+    main { padding:24px 0 40px; }
+    .kpis { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:10px; margin-bottom:16px; }
+    .kpi, .panel, .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; }
+    .kpi { padding:13px; min-height:84px; }
+    .kpi b { display:block; font-size:21px; margin-bottom:5px; }
+    .grid { display:grid; grid-template-columns:1.1fr .9fr; gap:16px; align-items:start; }
+    .section { padding:17px; }
     .section + .section { border-top:1px solid var(--line); }
-    h2 { margin:0 0 14px; font-size:16px; letter-spacing:0; }
-    .actions { display:grid; gap:12px; }
-    .action { padding:16px; }
-    .action-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; }
-    .action h3 { margin:0 0 4px; font-size:16px; letter-spacing:0; }
-    .badge { border:1px solid var(--line); padding:7px 9px; font-size:12px; background:#eef7f1; color:var(--green); white-space:nowrap; font-weight:700; }
-    .badge.no { background:#fff7e8; color:var(--amber); }
-    .trade { padding:13px; border-radius:8px; background:#111820; color:#e9f2ef; line-height:1.55; font-family: Consolas, ui-monospace, monospace; font-size:13px; margin-bottom:12px; }
-    .metrics { display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:8px; margin-bottom:12px; }
-    .metric { border:1px solid var(--line); border-radius:8px; padding:10px; background:#fff; }
+    .cards { display:grid; gap:12px; }
+    .card { padding:15px; }
+    .head { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin-bottom:12px; }
+    .badge { border:1px solid var(--line); padding:7px 9px; font-size:12px; font-weight:750; white-space:nowrap; color:var(--green); background:#edf8f2; }
+    .badge.no { color:var(--amber); background:#fff7e6; }
+    .trade { padding:13px; border-radius:8px; background:var(--dark); color:#eef7f3; line-height:1.55; font-family:Consolas, ui-monospace, monospace; font-size:13px; margin-bottom:12px; }
+    .metrics { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:8px; margin-bottom:12px; }
+    .metric { border:1px solid var(--line); border-radius:8px; padding:10px; background:#fff; min-height:66px; }
     .metric b { display:block; font-size:15px; margin-bottom:3px; }
     .metric span { color:var(--muted); font-size:12px; }
-    .legs { width:100%; border-collapse:collapse; font-size:13px; margin-bottom:12px; }
-    .legs th, .legs td { padding:9px 8px; border-bottom:1px solid var(--line); text-align:left; }
-    .legs th { color:var(--muted); font-weight:650; }
-    .sell { color:var(--red); font-weight:700; }
-    .buy { color:var(--green); font-weight:700; }
-    .ok { color:var(--green); font-weight:700; }
-    .warn-text { color:var(--amber); font-weight:700; }
-    .notes { display:grid; gap:8px; }
-    .note { border-left:3px solid var(--teal); padding:8px 10px; background:#f8fbfb; color:#34424d; font-size:13px; line-height:1.45; }
-    .note.warn { border-color:var(--amber); background:#fff9ef; }
-    .flow { display:grid; gap:10px; }
-    .step { display:grid; grid-template-columns:28px 1fr; gap:10px; align-items:start; }
-    .step i { display:grid; place-items:center; width:28px; height:28px; border:1px solid var(--line); color:var(--teal); font-style:normal; font-weight:700; }
-    .step strong { display:block; font-size:13px; margin-bottom:3px; }
-    .step span { display:block; color:var(--muted); font-size:12px; line-height:1.35; }
-    code { display:block; padding:12px; border:1px solid var(--line); border-radius:8px; background:#111820; color:#e9f2ef; overflow-x:auto; font-size:12px; line-height:1.6; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { text-align:left; padding:8px 7px; border-bottom:1px solid var(--line); vertical-align:top; }
+    th { color:var(--muted); font-weight:700; }
+    .sell { color:var(--red); font-weight:800; }
+    .buy { color:var(--green); font-weight:800; }
+    .notes { display:grid; gap:8px; margin-top:10px; }
+    .note { border-left:3px solid var(--blue); background:#f8fbfb; padding:8px 10px; font-size:13px; line-height:1.45; color:#34424d; }
+    .note.warn { border-color:var(--amber); background:#fff9ee; }
+    .zone-wrap { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .mini-title { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; }
+    .pill { color:var(--muted); border:1px solid var(--line); padding:5px 7px; font-size:12px; background:#fff; }
+    .empty { padding:16px; border:1px solid var(--line); background:#fff9ee; color:#724c12; border-radius:8px; line-height:1.45; }
     footer { padding:18px 0 30px; color:var(--muted); font-size:12px; }
-    @media (max-width: 920px) { .topbar { align-items:flex-start; flex-direction:column; } .grid, .hero, .metrics { grid-template-columns:1fr; } .status { max-width:none; } .action-head { flex-direction:column; } }
+    @media (max-width:1050px) { .grid, .kpis, .zone-wrap, .metrics { grid-template-columns:1fr; } .topbar { flex-direction:column; align-items:flex-start; } .status { max-width:none; } .head { flex-direction:column; } }
   </style>
 </head>
 <body>
   <header>
-    <div class="wrap topbar">
-      <div class="brand"><div class="mark">N</div><div><h1>NIFTY Options Action Board</h1><span>Trades only appear when reward/risk gates pass</span></div></div>
-      <div class="status"><span class="dot {% if board.source == 'SAMPLE' %}sample{% endif %}"></span>{{ board.status }}</div>
+    <div class='wrap topbar'>
+      <div class='brand'><div class='mark'>N</div><div><h1>NIFTY Writer Map & Trade Board</h1><div class='sub'>Live OI walls first, trade candidates second</div></div></div>
+      <div class='status'><span class='dot {% if not board.data_ok %}bad{% endif %}'></span>{{ board.status }}</div>
     </div>
   </header>
 
-  <main class="wrap">
-    <div class="hero">
-      <div class="kpi"><b>{{ '%.2f'|format(board.spot) }}</b><span>NIFTY spot used for strike selection</span></div>
-      <div class="kpi"><b>{{ board.source }}</b><span>Data source</span></div>
-      <div class="kpi"><b>{{ board.as_of }}</b><span>NSE chain timestamp</span></div>
-      <div class="kpi"><b>{{ board.cache_seconds // 60 }} min</b><span>Server cache interval</span></div>
+  <main class='wrap'>
+    <div class='kpis'>
+      <div class='kpi'><b>{{ '%.2f'|format(board.spot) }}</b><span class='muted'>NIFTY spot</span></div>
+      <div class='kpi'><b>{{ board.zones.writer_range }}</b><span class='muted'>Current writer range</span></div>
+      <div class='kpi'><b>{{ board.zones.pcr }}</b><span class='muted'>PE/CE OI ratio</span></div>
+      <div class='kpi'><b>{{ board.zones.bias }}</b><span class='muted'>OI tilt</span></div>
+      <div class='kpi'><b>{{ board.as_of }}</b><span class='muted'>NSE timestamp</span></div>
     </div>
 
-    <div class="grid">
-      <div class="panel">
-        <section class="section">
-          <h2>Actionable Writing Plans</h2>
-          <div class="actions">
+    {% if not board.data_ok %}
+      <div class='empty'>Live NSE data is unavailable right now, so the board is intentionally not showing trades. Redeploy or refresh after NSE allows the option-chain request. No sample trade is generated.</div>
+    {% endif %}
+
+    <div class='grid'>
+      <div class='panel'>
+        <section class='section'>
+          <h2>Actionable Trade Candidates</h2>
+          <div class='cards'>
             {% for plan in board.plans %}
-            <article class="action">
-              <div class="action-head">
-                <div><h3>{{ plan.title }}</h3><div class="muted">Expiry {{ plan.expiry }} | DTE {{ plan.dte }} | Lot size {{ plan.lot_size }} | Metrics: {{ plan.metric_scope }}</div></div>
-                <div class="badge {% if not plan.trade_ok %}no{% endif %}">{{ plan.decision }}</div>
+            <article class='card'>
+              <div class='head'>
+                <div><h3>{{ plan.title }}</h3><div class='muted'>Expiry {{ plan.expiry }} | DTE {{ plan.dte }} | Lot size {{ plan.lot_size }} | Metrics: {{ plan.metric_scope }}</div></div>
+                <div class='badge {% if not plan.trade_ok %}no{% endif %}'>{{ plan.decision }}</div>
               </div>
-              <div class="trade">{{ plan.trade_line }}</div>
-              <div class="metrics">
-                <div class="metric"><b>{{ plan.net_credit }}</b><span>Net credit / unit</span></div>
-                <div class="metric"><b>INR {{ '{:,.0f}'.format(plan.max_risk) }}</b><span>Max risk shown</span></div>
-                <div class="metric"><b>INR {{ '{:,.0f}'.format(plan.target_profit) }}</b><span>Target shown</span></div>
-                <div class="metric"><b>{{ plan.reward_to_risk_pct }}%</b><span>Target / max risk</span></div>
+              <div class='trade'>{{ plan.trade_line }}</div>
+              <div class='metrics'>
+                <div class='metric'><b>{{ plan.net_credit }}</b><span>Net credit / unit</span></div>
+                <div class='metric'><b>INR {{ '{:,.0f}'.format(plan.max_risk) }}</b><span>Max risk shown</span></div>
+                <div class='metric'><b>INR {{ '{:,.0f}'.format(plan.target_profit) }}</b><span>Target shown</span></div>
+                <div class='metric'><b>{{ plan.reward_to_risk_pct }}%</b><span>Target / max risk</span></div>
               </div>
-              <table class="legs">
+              {% if plan.legs %}
+              <table>
                 <tr><th>Side</th><th>Strike</th><th>Type</th><th>LTP</th><th>OI</th><th>Volume</th><th>IV</th></tr>
                 {% for leg in plan.legs %}
-                <tr><td class="{{ leg.side|lower }}">{{ leg.side }}</td><td>{{ leg.strike }}</td><td>{{ leg.type }}</td><td>{{ leg.ltp }}</td><td>{{ '{:,.0f}'.format(leg.oi) }}</td><td>{{ '{:,.0f}'.format(leg.volume) }}</td><td>{{ leg.iv }}</td></tr>
+                <tr><td class='{{ leg.side|lower }}'>{{ leg.side }}</td><td>{{ leg.strike }}</td><td>{{ leg.type }}</td><td>{{ leg.ltp }}</td><td>{{ '{:,.0f}'.format(leg.oi) }}</td><td>{{ '{:,.0f}'.format(leg.volume) }}</td><td>{{ leg.iv }}</td></tr>
                 {% endfor %}
               </table>
-              <div class="notes">
-                <div class="note {% if not plan.trade_ok %}warn{% endif %}">Decision: {{ plan.decision_reason }}</div>
-                <div class="note">Hard gates: credit >= {{ plan.min_credit }}, target/lot >= INR {{ '{:,.0f}'.format(plan.min_target_per_lot) }}, target/risk >= {{ (plan.min_reward_to_risk * 100)|round(1) }}%.</div>
-                <div class="note">Why these strikes: {{ plan.selection_reason }}</div>
-                <div class="note">Entry: {{ plan.entry_filter }}</div>
-                <div class="note warn">Invalid if: {{ plan.invalid_if }}</div>
-                <div class="note">Exit: {{ plan.exit_plan }}</div>
+              {% endif %}
+              <div class='notes'>
+                <div class='note {% if not plan.trade_ok %}warn{% endif %}'>Decision: {{ plan.decision_reason }}</div>
+                <div class='note'>Hard gates: credit >= {{ plan.min_credit }}, target/lot >= INR {{ '{:,.0f}'.format(plan.min_target_per_lot) }}, target/risk >= {{ (plan.min_reward_to_risk * 100)|round(1) }}%.</div>
+                <div class='note'>Writer basis: {{ plan.selection_reason }}</div>
+                <div class='note'>Entry: {{ plan.entry_filter }}</div>
+                <div class='note warn'>Invalid if: {{ plan.invalid_if }}</div>
+                <div class='note'>Exit: {{ plan.exit_plan }}</div>
               </div>
             </article>
+            {% else %}
+            <div class='empty'>No live trade candidate can be generated until NSE option-chain data is available.</div>
             {% endfor %}
           </div>
         </section>
       </div>
 
-      <aside class="panel">
-        <section class="section">
-          <h2>How To Use</h2>
-          <div class="flow">
-            <div class="step"><i>1</i><div><strong>Only trade green</strong><span>If decision is NO TRADE, the structure is watchlist context only.</span></div></div>
-            <div class="step"><i>2</i><div><strong>Reject bad asymmetry</strong><span>The board blocks tiny-credit structures such as INR 400 target vs INR 18K risk.</span></div></div>
-            <div class="step"><i>3</i><div><strong>Use defined risk</strong><span>Enter hedge legs with short legs. Do not run this naked unless you explicitly choose that risk.</span></div></div>
-            <div class="step"><i>4</i><div><strong>Verify in broker</strong><span>Check margin, liquidity, bid-ask spread, and event risk before placing orders.</span></div></div>
+      <aside class='panel'>
+        <section class='section'>
+          <h2>Where Writers Are Short</h2>
+          <div class='zone-wrap'>
+            <div>
+              <div class='mini-title'><h3>Put Writers / Support</h3><span class='pill'>PE shorts proxy</span></div>
+              <table>
+                <tr><th>Strike</th><th>Signal</th><th>OI</th><th>Chg OI</th><th>LTP</th><th>Score</th></tr>
+                {% for zone in board.zones.puts %}
+                <tr><td>{{ zone.strike }}</td><td>{{ zone.signal }}</td><td>{{ '{:,.0f}'.format(zone.oi) }}</td><td>{{ '{:,.0f}'.format(zone.chg_oi) }}</td><td>{{ zone.ltp }}</td><td>{{ zone.score }}</td></tr>
+                {% else %}
+                <tr><td colspan='6'>No live PE writer zones.</td></tr>
+                {% endfor %}
+              </table>
+            </div>
+            <div>
+              <div class='mini-title'><h3>Call Writers / Resistance</h3><span class='pill'>CE shorts proxy</span></div>
+              <table>
+                <tr><th>Strike</th><th>Signal</th><th>OI</th><th>Chg OI</th><th>LTP</th><th>Score</th></tr>
+                {% for zone in board.zones.calls %}
+                <tr><td>{{ zone.strike }}</td><td>{{ zone.signal }}</td><td>{{ '{:,.0f}'.format(zone.oi) }}</td><td>{{ '{:,.0f}'.format(zone.chg_oi) }}</td><td>{{ zone.ltp }}</td><td>{{ zone.score }}</td></tr>
+                {% else %}
+                <tr><td colspan='6'>No live CE writer zones.</td></tr>
+                {% endfor %}
+              </table>
+            </div>
           </div>
         </section>
-        <section class="section">
-          <h2>No Manual Token</h2>
-          <code>Data source: NSE public option chain<br>Broker token: not required<br>Optional env: NIFTY_LOT_SIZE, NSE_CACHE_SECONDS</code>
+
+        <section class='section'>
+          <h2>Participant Bias</h2>
+          {% if board.participant %}
+            <div class='note'>{{ board.participant.summary.bias }} | Date {{ board.participant.date }}. {{ board.participant.note }}</div>
+            <table>
+              <tr><th>Type</th><th>Fut Net</th><th>Call Short</th><th>Put Short</th><th>Call Net</th><th>Put Net</th></tr>
+              {% for row in board.participant.rows %}
+              <tr><td>{{ row.client_type }}</td><td>{{ '{:,.0f}'.format(row.future_net) }}</td><td>{{ '{:,.0f}'.format(row.call_short) }}</td><td>{{ '{:,.0f}'.format(row.put_short) }}</td><td>{{ '{:,.0f}'.format(row.call_net) }}</td><td>{{ '{:,.0f}'.format(row.put_net) }}</td></tr>
+              {% endfor %}
+            </table>
+          {% else %}
+            <div class='empty'>Participant OI archive was not available during this refresh. Strike map still uses live option-chain OI.</div>
+          {% endif %}
         </section>
       </aside>
     </div>
   </main>
 
-  <footer class="wrap">Research software only. This is not investment advice or an order instruction. Verify liquidity, margin, and risk before trading.</footer>
+  <footer class='wrap'>Research software only. Strike-level FII identity is not public, so writer zones are OI/OI-change proxies. Verify spreads, margin, event risk, and order execution before trading.</footer>
 </body>
 </html>
-"""
+'''
 
 
-@app.get("/")
+@app.get('/')
 def index():
     return render_template_string(PAGE, board=load_action_board())
 
 
-@app.get("/api/action-plan")
+@app.get('/api/action-plan')
 def action_plan():
     return jsonify(load_action_board())
 
 
-@app.get("/api/strategy-configs")
+@app.get('/api/strategy-configs')
 def strategy_configs():
     configs: list[dict[str, object]] = []
-    for path in sorted(CONFIG_DIR.glob("*.json")):
+    for path in sorted(CONFIG_DIR.glob('*.json')):
         try:
-            configs.append(json.loads(path.read_text(encoding="utf-8")))
+            configs.append(json.loads(path.read_text(encoding='utf-8')))
         except json.JSONDecodeError:
             continue
     return jsonify(configs)
 
 
-@app.get("/healthz")
+@app.get('/healthz')
 def healthz():
-    return "ok", 200
+    return 'ok', 200
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8050, debug=True)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8050, debug=True)
