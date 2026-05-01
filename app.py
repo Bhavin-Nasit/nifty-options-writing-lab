@@ -5,6 +5,7 @@ import io
 import json
 import math
 import os
+import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -21,6 +22,7 @@ NSE_BASE_URL = 'https://www.nseindia.com'
 NSE_CHAIN_URL = f'{NSE_BASE_URL}/api/option-chain-indices?symbol=NIFTY'
 NSE_CHAIN_PAGE = f'{NSE_BASE_URL}/option-chain'
 NSE_PARTICIPANT_URL = 'https://archives.nseindia.com/content/nsccl/fao_participant_oi_{stamp}.csv'
+NSE_BHAVCOPY_URL = 'https://archives.nseindia.com/content/historical/DERIVATIVES/{year}/{month}/fo{stamp}bhav.csv.zip'
 CACHE_SECONDS = int(os.getenv('NSE_CACHE_SECONDS', '900'))
 NIFTY_LOT_SIZE = int(os.getenv('NIFTY_LOT_SIZE', '65'))
 
@@ -66,8 +68,16 @@ def ceil_to_step(value: float, step: int = 50) -> int:
     return int(math.ceil(value / step) * step)
 
 
+def clean_cell(value: object) -> str:
+    return str(value or '').strip().replace('\ufeff', '')
+
+
 def parse_nse_expiry(value: str) -> date:
     return datetime.strptime(value, '%d-%b-%Y').date()
+
+
+def parse_bhavcopy_expiry(value: object) -> date:
+    return datetime.strptime(clean_cell(value).title(), '%d-%b-%Y').date()
 
 
 def last_expiry_by_month(expiries: list[date]) -> list[date]:
@@ -137,8 +147,11 @@ def fetch_nse_option_chain() -> dict[str, object]:
 
 def parse_chain(payload: dict[str, object]) -> tuple[float, str, list[date], list[OptionRow]]:
     records = payload.get('records', {}) if isinstance(payload, dict) else {}
+    filtered = payload.get('filtered', {}) if isinstance(payload, dict) else {}
     spot = safe_number(records.get('underlyingValue'), 0.0) if isinstance(records, dict) else 0.0
-    timestamp = str(records.get('timestamp') or now_ist_label()) if isinstance(records, dict) else now_ist_label()
+    if spot <= 0 and isinstance(filtered, dict):
+        spot = safe_number(filtered.get('underlyingValue'), 0.0)
+    timestamp = str(records.get('timestamp') or filtered.get('timestamp') or now_ist_label()) if isinstance(records, dict) else now_ist_label()
     expiry_values = records.get('expiryDates', []) if isinstance(records, dict) else []
     expiries: list[date] = []
     for value in expiry_values:
@@ -148,8 +161,10 @@ def parse_chain(payload: dict[str, object]) -> tuple[float, str, list[date], lis
             continue
     expiries = sorted(expiries)
 
-    rows: list[OptionRow] = []
     raw_rows = records.get('data', []) if isinstance(records, dict) else []
+    if not raw_rows and isinstance(filtered, dict):
+        raw_rows = filtered.get('data', [])
+    rows: list[OptionRow] = []
     for item in raw_rows:
         if not isinstance(item, dict) or 'expiryDate' not in item:
             continue
@@ -179,6 +194,100 @@ def parse_chain(payload: dict[str, object]) -> tuple[float, str, list[date], lis
         except (TypeError, ValueError):
             continue
     return spot, timestamp, expiries, rows
+
+
+def fetch_bhavcopy_for_day(session: requests.Session, day: date) -> tuple[float, str, list[date], list[OptionRow]] | None:
+    stamp = day.strftime('%d%b%Y').upper()
+    url = NSE_BHAVCOPY_URL.format(year=day.year, month=day.strftime('%b').upper(), stamp=stamp)
+    response = session.get(url, timeout=20)
+    if response.status_code != 200 or not response.content:
+        return None
+
+    grouped: dict[tuple[date, int], dict[str, dict[str, float]]] = {}
+    futures: list[tuple[date, float]] = []
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        csv_name = next((name for name in archive.namelist() if name.lower().endswith('.csv')), None)
+        if not csv_name:
+            return None
+        with archive.open(csv_name) as handle:
+            reader = csv.DictReader(io.TextIOWrapper(handle, encoding='utf-8', errors='ignore'))
+            for item in reader:
+                if clean_cell(item.get('SYMBOL')).upper() != 'NIFTY':
+                    continue
+                instrument = clean_cell(item.get('INSTRUMENT')).upper()
+                try:
+                    expiry = parse_bhavcopy_expiry(item.get('EXPIRY_DT'))
+                except ValueError:
+                    continue
+                if instrument == 'FUTIDX':
+                    close = safe_number(item.get('CLOSE'))
+                    if close > 0:
+                        futures.append((expiry, close))
+                    continue
+                if instrument != 'OPTIDX':
+                    continue
+                option_type = clean_cell(item.get('OPTION_TYP')).upper()
+                if option_type not in ('CE', 'PE'):
+                    continue
+                strike = safe_int(item.get('STRIKE_PR'))
+                if strike <= 0:
+                    continue
+                key = (expiry, strike)
+                grouped.setdefault(key, {})[option_type] = {
+                    'ltp': safe_number(item.get('CLOSE')),
+                    'oi': safe_number(item.get('OPEN_INT')),
+                    'chg_oi': safe_number(item.get('CHG_IN_OI')),
+                    'volume': safe_number(item.get('CONTRACTS')),
+                }
+
+    rows: list[OptionRow] = []
+    for key, legs in grouped.items():
+        expiry, strike = key
+        ce = legs.get('CE', {})
+        pe = legs.get('PE', {})
+        rows.append(
+            OptionRow(
+                expiry=expiry,
+                strike=strike,
+                ce_ltp=safe_number(ce.get('ltp')),
+                pe_ltp=safe_number(pe.get('ltp')),
+                ce_change=0.0,
+                pe_change=0.0,
+                ce_oi=safe_int(ce.get('oi')),
+                pe_oi=safe_int(pe.get('oi')),
+                ce_chg_oi=safe_int(ce.get('chg_oi')),
+                pe_chg_oi=safe_int(pe.get('chg_oi')),
+                ce_volume=safe_int(ce.get('volume')),
+                pe_volume=safe_int(pe.get('volume')),
+                ce_iv=0.0,
+                pe_iv=0.0,
+            )
+        )
+    if not rows:
+        return None
+
+    future_candidates = sorted((item for item in futures if item[0] >= day and item[1] > 0), key=lambda item: item[0])
+    spot = future_candidates[0][1] if future_candidates else 0.0
+    if spot <= 0:
+        active = max(rows, key=lambda row: row.ce_oi + row.pe_oi)
+        spot = float(active.strike)
+    expiries = sorted({row.expiry for row in rows if row.expiry >= day})
+    timestamp = f'{day.strftime('%d %b %Y')} EOD F&O bhavcopy'
+    return spot, timestamp, expiries, rows
+
+
+def fetch_bhavcopy_option_chain() -> tuple[float, str, list[date], list[OptionRow]]:
+    session = requests.Session()
+    session.headers.update(nse_headers())
+    for offset in range(0, 14):
+        day = today_ist() - timedelta(days=offset)
+        try:
+            result = fetch_bhavcopy_for_day(session, day)
+            if result:
+                return result
+        except (requests.RequestException, zipfile.BadZipFile, OSError):
+            continue
+    raise ValueError('NSE F&O bhavcopy fallback returned no usable rows')
 
 
 def choose_expiries(expiries: list[date], base: date) -> tuple[date, date]:
@@ -309,10 +418,6 @@ def build_writer_map(rows: list[OptionRow], spot: float, expiry: date) -> dict[s
         'total_pe_oi': total_pe_oi,
         'total_ce_oi': total_ce_oi,
     }
-
-
-def clean_cell(value: object) -> str:
-    return str(value or '').strip().replace('\ufeff', '')
 
 
 def parse_participant_oi(text: str, day: date) -> dict[str, object] | None:
@@ -450,7 +555,7 @@ def estimate_values(plan: dict[str, object]) -> None:
     min_credit = safe_number(plan.get('min_credit'))
     min_target = safe_number(plan.get('min_target_per_lot'))
     min_rr = safe_number(plan.get('min_reward_to_risk'))
-    source_ok = plan.get('source') == 'NSE'
+    source_ok = plan.get('source') in ('NSE', 'NSE_EOD')
     prices_ok = bool(legs) and all(isinstance(leg, dict) and safe_number(leg.get('ltp')) > 0 for leg in legs)
     credit_ok = credit >= min_credit
     target_ok = target_per_lot >= min_target
@@ -459,9 +564,9 @@ def estimate_values(plan: dict[str, object]) -> None:
 
     reasons: list[str] = []
     if not source_ok:
-        reasons.append('live NSE data is unavailable')
+        reasons.append('real NSE data is unavailable')
     if not prices_ok:
-        reasons.append('one or more live leg prices are missing')
+        reasons.append('one or more leg prices are missing')
     if not credit_ok:
         reasons.append(f'credit {credit:.2f} is below required {min_credit:.2f}')
     if not target_ok:
@@ -483,8 +588,12 @@ def estimate_values(plan: dict[str, object]) -> None:
     plan['reward_to_risk'] = round(reward_to_risk, 4)
     plan['reward_to_risk_pct'] = round(reward_to_risk * 100, 1)
     plan['trade_ok'] = trade_ok
-    plan['decision'] = 'TRADE CANDIDATE' if trade_ok else 'NO TRADE'
-    plan['decision_reason'] = '; '.join(reasons) if reasons else 'All hard gates passed. Verify broker margin, spreads, and event risk before order entry.'
+    if trade_ok and plan.get('source') == 'NSE_EOD':
+        plan['decision'] = 'EOD CANDIDATE'
+        plan['decision_reason'] = 'Real NSE EOD bhavcopy candidate. Verify live broker LTP, bid-ask spread, and margin before placing any order.'
+    else:
+        plan['decision'] = 'TRADE CANDIDATE' if trade_ok else 'NO TRADE'
+        plan['decision_reason'] = '; '.join(reasons) if reasons else 'All hard gates passed. Verify broker margin, spreads, and event risk before order entry.'
     plan['metric_scope'] = 'selected lots' if trade_ok else '1-lot rejection view'
 
 
@@ -497,13 +606,15 @@ def leg_command(prefix: str, leg: dict[str, object], lots: int) -> str:
 def trade_line(plan: dict[str, object]) -> str:
     legs = plan.get('legs', [])
     if not isinstance(legs, list) or not legs:
-        return 'NO TRADE. Live option rows unavailable for this expiry.'
+        return 'NO TRADE. Option rows unavailable for this expiry.'
     lots = safe_int(plan.get('suggested_lots'))
     shown_lots = lots if lots > 0 else 1
     sell_legs = [leg for leg in legs if isinstance(leg, dict) and leg.get('side') == 'SELL']
     buy_legs = [leg for leg in legs if isinstance(leg, dict) and leg.get('side') == 'BUY']
     sell_text = ' + '.join(leg_command('SELL', leg, shown_lots) for leg in sell_legs)
     buy_text = ' + '.join(leg_command('BUY', leg, shown_lots) for leg in buy_legs)
+    if lots > 0 and plan.get('source') == 'NSE_EOD':
+        return f'EOD CANDIDATE. Verify live broker prices first: {sell_text}; hedge with {buy_text}'
     if lots > 0:
         return f'{sell_text}; hedge with {buy_text}'
     return f'NO TRADE. Watch zones only: {sell_text}; hedge with {buy_text}'
@@ -531,7 +642,7 @@ def zone_pool(zones: list[dict[str, object]], min_distance: int, max_distance: i
 
 
 def no_trade_plan(kind: str, title: str, expiry: date, source: str, reason: str, params: dict[str, object]) -> dict[str, object]:
-    plan = {
+    return {
         'kind': kind,
         'title': title,
         'source': source,
@@ -563,10 +674,9 @@ def no_trade_plan(kind: str, title: str, expiry: date, source: str, reason: str,
         'trade_ok': False,
         'decision': 'NO TRADE',
         'decision_reason': reason,
-        'trade_line': 'NO TRADE. No live candidate cleared the data screen.',
+        'trade_line': 'NO TRADE. No candidate cleared the data screen.',
         'rank_score': 0,
     }
-    return plan
 
 
 def build_pair_plan(kind: str, title: str, spot: float, expiry: date, rows: list[OptionRow], source: str, pe_zone: dict[str, object], ce_zone: dict[str, object], params: dict[str, object]) -> dict[str, object]:
@@ -679,7 +789,7 @@ def strategy_params(kind: str) -> tuple[str, dict[str, object]]:
 def build_action_plan(kind: str, spot: float, expiry: date, rows: list[OptionRow], source: str) -> dict[str, object]:
     title, params = strategy_params(kind)
     if not rows:
-        return no_trade_plan(kind, title, expiry, source, 'No live option rows available for this expiry.', params)
+        return no_trade_plan(kind, title, expiry, source, 'No option rows available for this expiry.', params)
     pe_zones = build_writing_zones(rows, 'PE', spot)
     ce_zones = build_writing_zones(rows, 'CE', spot)
     min_distance = max(safe_int(params['min_distance_floor']), ceil_to_step(spot * safe_number(params['distance_pct'])))
@@ -687,7 +797,7 @@ def build_action_plan(kind: str, spot: float, expiry: date, rows: list[OptionRow
     pe_pool = zone_pool(pe_zones, min_distance, max_distance, safe_number(params['min_premium']))
     ce_pool = zone_pool(ce_zones, min_distance, max_distance, safe_number(params['min_premium']))
     if not pe_pool or not ce_pool:
-        return no_trade_plan(kind, title, expiry, source, 'No put/call writer-zone pair has enough distance and live premium.', params)
+        return no_trade_plan(kind, title, expiry, source, 'No put/call writer-zone pair has enough distance and premium.', params)
 
     candidates: list[dict[str, object]] = []
     for pe_zone in pe_pool:
@@ -696,7 +806,7 @@ def build_action_plan(kind: str, spot: float, expiry: date, rows: list[OptionRow
                 continue
             candidates.append(build_pair_plan(kind, title, spot, expiry, rows, source, pe_zone, ce_zone, params))
     if not candidates:
-        return no_trade_plan(kind, title, expiry, source, 'No valid support/resistance pair could be formed from live writer zones.', params)
+        return no_trade_plan(kind, title, expiry, source, 'No valid support/resistance pair could be formed from writer zones.', params)
     passing = [plan for plan in candidates if plan.get('trade_ok')]
     if passing:
         return max(passing, key=lambda plan: safe_number(plan.get('rank_score')))
@@ -707,7 +817,7 @@ def unavailable_board(error: str) -> dict[str, object]:
     return {
         'source': 'UNAVAILABLE',
         'data_ok': False,
-        'status': f'Live NSE option-chain refresh failed. No sample trades are generated. Error: {error}',
+        'status': f'NSE live and bhavcopy sources failed. Error: {error}',
         'spot': 0,
         'as_of': '-',
         'server_refreshed_at': now_ist_label(),
@@ -733,34 +843,41 @@ def unavailable_board(error: str) -> dict[str, object]:
 
 def load_action_board_uncached() -> dict[str, object]:
     base = today_ist()
+    status = 'Live NSE option-chain writer map. Broker token not required.'
+    source = 'NSE'
     try:
         payload = fetch_nse_option_chain()
         spot, timestamp, expiries, rows = parse_chain(payload)
         if spot <= 0 or not rows:
             raise ValueError('NSE option chain returned no usable rows')
-        weekly_expiry, monthly_expiry = choose_expiries(expiries, base)
-    except Exception as exc:  # noqa: BLE001 - NSE can block hosted traffic intermittently
-        stale = _CACHE.get('board')
-        if isinstance(stale, dict) and stale.get('source') == 'NSE':
-            copy = dict(stale)
-            copy['stale'] = True
-            copy['status'] = f'NSE refresh failed, showing last cached live board. Error: {exc}'
-            copy['server_refreshed_at'] = now_ist_label()
-            return copy
-        return unavailable_board(str(exc))
+    except Exception as live_exc:  # noqa: BLE001 - NSE can block hosted traffic intermittently
+        try:
+            spot, timestamp, expiries, rows = fetch_bhavcopy_option_chain()
+            source = 'NSE_EOD'
+            status = f'Live NSE option-chain unavailable, using latest real NSE F&O bhavcopy. Verify broker live LTP before trading. Live error: {live_exc}'
+        except Exception as fallback_exc:  # noqa: BLE001
+            stale = _CACHE.get('board')
+            if isinstance(stale, dict) and stale.get('source') in ('NSE', 'NSE_EOD'):
+                copy = dict(stale)
+                copy['stale'] = True
+                copy['status'] = f'Refresh failed, showing last cached real board. Live error: {live_exc}; fallback error: {fallback_exc}'
+                copy['server_refreshed_at'] = now_ist_label()
+                return copy
+            return unavailable_board(f'live error: {live_exc}; fallback error: {fallback_exc}')
 
+    weekly_expiry, monthly_expiry = choose_expiries(expiries, base)
     weekly_rows = rows_for_expiry(rows, weekly_expiry)
     monthly_rows = rows_for_expiry(rows, monthly_expiry)
     zones = build_writer_map(weekly_rows, spot, weekly_expiry)
     participant = fetch_participant_oi()
     plans = [
-        build_action_plan('weekly', spot, weekly_expiry, weekly_rows, 'NSE'),
-        build_action_plan('monthly', spot, monthly_expiry, monthly_rows, 'NSE'),
+        build_action_plan('weekly', spot, weekly_expiry, weekly_rows, source),
+        build_action_plan('monthly', spot, monthly_expiry, monthly_rows, source),
     ]
     return {
-        'source': 'NSE',
+        'source': source,
         'data_ok': True,
-        'status': 'Live NSE option-chain writer map. Broker token not required. Strike-level FII identity is not public; zones use OI/OI-change proxy.',
+        'status': status,
         'spot': round(spot, 2),
         'as_of': timestamp,
         'server_refreshed_at': now_ist_label(),
@@ -804,7 +921,7 @@ PAGE = '''
     h2 { margin:0 0 12px; font-size:16px; letter-spacing:0; }
     h3 { margin:0 0 5px; font-size:15px; letter-spacing:0; }
     .sub, .muted { color:var(--muted); font-size:13px; }
-    .status { display:flex; align-items:center; gap:9px; padding:8px 11px; border:1px solid var(--line); background:#fff; font-size:13px; max-width:560px; }
+    .status { display:flex; align-items:center; gap:9px; padding:8px 11px; border:1px solid var(--line); background:#fff; font-size:13px; max-width:660px; }
     .dot { width:9px; height:9px; border-radius:99px; background:var(--green); flex:0 0 auto; }
     .dot.bad { background:var(--red); }
     main { padding:24px 0 40px; }
@@ -844,22 +961,22 @@ PAGE = '''
 <body>
   <header>
     <div class='wrap topbar'>
-      <div class='brand'><div class='mark'>N</div><div><h1>NIFTY Writer Map & Trade Board</h1><div class='sub'>Live OI walls first, trade candidates second</div></div></div>
+      <div class='brand'><div class='mark'>N</div><div><h1>NIFTY Writer Map & Trade Board</h1><div class='sub'>Live chain first, real NSE bhavcopy fallback second</div></div></div>
       <div class='status'><span class='dot {% if not board.data_ok %}bad{% endif %}'></span>{{ board.status }}</div>
     </div>
   </header>
 
   <main class='wrap'>
     <div class='kpis'>
-      <div class='kpi'><b>{{ '%.2f'|format(board.spot) }}</b><span class='muted'>NIFTY spot</span></div>
+      <div class='kpi'><b>{{ '%.2f'|format(board.spot) }}</b><span class='muted'>NIFTY spot/future proxy</span></div>
       <div class='kpi'><b>{{ board.zones.writer_range }}</b><span class='muted'>Current writer range</span></div>
       <div class='kpi'><b>{{ board.zones.pcr }}</b><span class='muted'>PE/CE OI ratio</span></div>
-      <div class='kpi'><b>{{ board.zones.bias }}</b><span class='muted'>OI tilt</span></div>
-      <div class='kpi'><b>{{ board.as_of }}</b><span class='muted'>NSE timestamp</span></div>
+      <div class='kpi'><b>{{ board.source }}</b><span class='muted'>Data source</span></div>
+      <div class='kpi'><b>{{ board.as_of }}</b><span class='muted'>Data timestamp</span></div>
     </div>
 
     {% if not board.data_ok %}
-      <div class='empty'>Live NSE data is unavailable right now, so the board is intentionally not showing trades. Redeploy or refresh after NSE allows the option-chain request. No sample trade is generated.</div>
+      <div class='empty'>Both live option-chain and real bhavcopy fallback are unavailable right now, so the board is intentionally not showing trades.</div>
     {% endif %}
 
     <div class='grid'>
@@ -898,7 +1015,7 @@ PAGE = '''
               </div>
             </article>
             {% else %}
-            <div class='empty'>No live trade candidate can be generated until NSE option-chain data is available.</div>
+            <div class='empty'>No trade candidate can be generated until a real NSE source is available.</div>
             {% endfor %}
           </div>
         </section>
@@ -915,7 +1032,7 @@ PAGE = '''
                 {% for zone in board.zones.puts %}
                 <tr><td>{{ zone.strike }}</td><td>{{ zone.signal }}</td><td>{{ '{:,.0f}'.format(zone.oi) }}</td><td>{{ '{:,.0f}'.format(zone.chg_oi) }}</td><td>{{ zone.ltp }}</td><td>{{ zone.score }}</td></tr>
                 {% else %}
-                <tr><td colspan='6'>No live PE writer zones.</td></tr>
+                <tr><td colspan='6'>No PE writer zones.</td></tr>
                 {% endfor %}
               </table>
             </div>
@@ -926,7 +1043,7 @@ PAGE = '''
                 {% for zone in board.zones.calls %}
                 <tr><td>{{ zone.strike }}</td><td>{{ zone.signal }}</td><td>{{ '{:,.0f}'.format(zone.oi) }}</td><td>{{ '{:,.0f}'.format(zone.chg_oi) }}</td><td>{{ zone.ltp }}</td><td>{{ zone.score }}</td></tr>
                 {% else %}
-                <tr><td colspan='6'>No live CE writer zones.</td></tr>
+                <tr><td colspan='6'>No CE writer zones.</td></tr>
                 {% endfor %}
               </table>
             </div>
@@ -944,14 +1061,14 @@ PAGE = '''
               {% endfor %}
             </table>
           {% else %}
-            <div class='empty'>Participant OI archive was not available during this refresh. Strike map still uses live option-chain OI.</div>
+            <div class='empty'>Participant OI archive was not available during this refresh. Strike map still uses option-chain or bhavcopy OI.</div>
           {% endif %}
         </section>
       </aside>
     </div>
   </main>
 
-  <footer class='wrap'>Research software only. Strike-level FII identity is not public, so writer zones are OI/OI-change proxies. Verify spreads, margin, event risk, and order execution before trading.</footer>
+  <footer class='wrap'>Research software only. Strike-level FII identity is not public, so writer zones are OI/OI-change proxies. Verify live broker prices, spreads, margin, event risk, and order execution before trading.</footer>
 </body>
 </html>
 '''
