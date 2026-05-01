@@ -53,10 +53,6 @@ def now_ist_label() -> str:
     return now_ist().strftime("%d %b %Y, %I:%M %p IST")
 
 
-def round_to_step(value: float, step: int = 50) -> int:
-    return int(round(value / step) * step)
-
-
 def floor_to_step(value: float, step: int = 50) -> int:
     return int(math.floor(value / step) * step)
 
@@ -242,7 +238,7 @@ def select_short_candidate(
             "volume": row.pe_volume if row and option_type == "PE" else (row.ce_volume if row else 0),
             "iv": row.pe_iv if row and option_type == "PE" else (row.ce_iv if row else 0.0),
             "score": 0.0,
-            "reason": "Fallback nearest strike. Check liquidity manually.",
+            "reason": "Fallback nearest strike. Liquidity/premium did not clear selection screen.",
         }
 
     max_oi = metric_max(candidates, "oi")
@@ -255,11 +251,11 @@ def select_short_candidate(
     for candidate in candidates:
         distance_penalty = candidate["distance"] / max_dist
         score = (
-            0.42 * candidate["oi"] / max_oi
-            + 0.22 * candidate["chg_oi"] / max_chg
-            + 0.18 * candidate["volume"] / max_volume
-            + 0.18 * candidate["ltp"] / max_ltp
-            - 0.10 * distance_penalty
+            0.36 * candidate["oi"] / max_oi
+            + 0.20 * candidate["chg_oi"] / max_chg
+            + 0.16 * candidate["volume"] / max_volume
+            + 0.28 * candidate["ltp"] / max_ltp
+            - 0.08 * distance_penalty
         )
         if score > best_score:
             best_score = score
@@ -302,30 +298,62 @@ def estimate_values(plan: dict[str, object]) -> None:
     wing = int(plan["wing_width"])
     lot_size = int(plan["lot_size"])
     max_risk_per_lot = max(0.0, (wing - credit) * lot_size)
+    target_per_lot = credit * lot_size * float(plan["target_capture"])
+    stop_per_lot = credit * lot_size * float(plan["stop_multiple"])
+    reward_to_risk = 0.0 if max_risk_per_lot <= 0 else target_per_lot / max_risk_per_lot
     risk_budget = float(plan["capital"]) * float(plan["risk_pct"])
-    if max_risk_per_lot <= 0:
-        lots = 1
-    else:
-        lots = max(1, min(int(plan["max_lots"]), int(risk_budget // max_risk_per_lot)))
-    plan["suggested_lots"] = lots
+
+    forced_lots = 1 if max_risk_per_lot <= 0 else max(1, min(int(plan["max_lots"]), int(risk_budget // max_risk_per_lot)))
+    credit_ok = credit >= float(plan["min_credit"])
+    target_ok = target_per_lot >= float(plan["min_target_per_lot"])
+    rr_ok = reward_to_risk >= float(plan["min_reward_to_risk"])
+    source_ok = plan["source"] == "NSE"
+    prices_ok = all(float(leg["ltp"]) > 0 for leg in legs)
+    trade_ok = credit_ok and target_ok and rr_ok and source_ok and prices_ok and forced_lots > 0
+
+    reasons = []
+    if not source_ok:
+        reasons.append("source is SAMPLE, not live NSE")
+    if not prices_ok:
+        reasons.append("one or more leg prices are missing")
+    if not credit_ok:
+        reasons.append(f"credit {credit:.2f} is below required {float(plan['min_credit']):.2f}")
+    if not target_ok:
+        reasons.append(f"target/lot INR {target_per_lot:.0f} is below required INR {float(plan['min_target_per_lot']):.0f}")
+    if not rr_ok:
+        reasons.append(f"target-to-risk {reward_to_risk * 100:.1f}% is below required {float(plan['min_reward_to_risk']) * 100:.1f}%")
+    if forced_lots <= 0:
+        reasons.append("risk budget does not support even one lot")
+
+    plan["suggested_lots"] = forced_lots if trade_ok else 0
     plan["net_credit"] = round(credit, 2)
-    plan["max_risk"] = round(max_risk_per_lot * lots, 0)
-    plan["target_profit"] = round(credit * lot_size * lots * float(plan["target_capture"]), 0)
-    plan["stop_loss"] = round(credit * lot_size * lots * float(plan["stop_multiple"]), 0)
+    plan["max_risk"] = round(max_risk_per_lot * (forced_lots if trade_ok else 1), 0)
+    plan["target_profit"] = round(target_per_lot * (forced_lots if trade_ok else 1), 0)
+    plan["stop_loss"] = round(stop_per_lot * (forced_lots if trade_ok else 1), 0)
     plan["risk_budget"] = round(risk_budget, 0)
-    plan["credit_ok"] = credit >= float(plan["min_credit"])
+    plan["credit_ok"] = credit_ok
+    plan["target_ok"] = target_ok
+    plan["reward_to_risk"] = round(reward_to_risk, 4)
+    plan["reward_to_risk_pct"] = round(reward_to_risk * 100, 1)
+    plan["trade_ok"] = trade_ok
+    plan["decision"] = "TRADE CANDIDATE" if trade_ok else "NO TRADE"
+    plan["decision_reason"] = "; ".join(reasons) if reasons else "All hard gates passed. Still verify broker margin, spread, and event risk."
+    plan["metric_scope"] = "selected lots" if trade_ok else "1-lot watchlist only"
 
 
 def trade_line(plan: dict[str, object]) -> str:
-    lots = plan.get("suggested_lots", 1)
+    lots = plan.get("suggested_lots", 0)
+    shown_lots = lots if lots and lots > 0 else 1
     sell_legs = [leg for leg in plan["legs"] if leg["side"] == "SELL"]
     buy_legs = [leg for leg in plan["legs"] if leg["side"] == "BUY"]
-    sell_text = " + ".join(f"SELL {lots} lot {leg['strike']} {leg['type']}" for leg in sell_legs)
-    buy_text = " + ".join(f"BUY {lots} lot {leg['strike']} {leg['type']}" for leg in buy_legs)
-    return f"{sell_text}; hedge with {buy_text}"
+    sell_text = " + ".join(f"SELL {shown_lots} lot {leg['strike']} {leg['type']}" for leg in sell_legs)
+    buy_text = " + ".join(f"BUY {shown_lots} lot {leg['strike']} {leg['type']}" for leg in buy_legs)
+    if lots and lots > 0:
+        return f"{sell_text}; hedge with {buy_text}"
+    return f"NO TRADE. Watchlist only: {sell_text}; hedge with {buy_text}"
 
 
-def build_action_plan(kind: str, spot: float, expiry: date, rows: list[OptionRow]) -> dict[str, object]:
+def build_action_plan(kind: str, spot: float, expiry: date, rows: list[OptionRow], source: str) -> dict[str, object]:
     base = today_ist()
     if kind == "weekly":
         min_distance = max(300, ceil_to_step(spot * 0.018))
@@ -337,8 +365,11 @@ def build_action_plan(kind: str, spot: float, expiry: date, rows: list[OptionRow
         max_lots = 3
         target_capture = 0.55
         stop_multiple = 1.75
+        min_credit_ratio = 0.20
+        min_target_per_lot = 1500
+        min_reward_to_risk = 0.08
         title = "Weekly OI-Supported Iron Condor"
-        entry_filter = "Use after the first 30-45 minutes. Enter only if spot remains between the short strikes and market breadth is not one-way trending."
+        entry_filter = "Use after the first 30-45 minutes only if hard gates pass and spot remains comfortably between short strikes."
     else:
         min_distance = max(650, ceil_to_step(spot * 0.04))
         max_distance = max(1900, ceil_to_step(spot * 0.10))
@@ -349,6 +380,9 @@ def build_action_plan(kind: str, spot: float, expiry: date, rows: list[OptionRow
         max_lots = 2
         target_capture = 0.60
         stop_multiple = 1.90
+        min_credit_ratio = 0.18
+        min_target_per_lot = 2500
+        min_reward_to_risk = 0.07
         title = "Monthly OI-Supported Wide Iron Condor"
         entry_filter = "Prefer entry when VIX/IV is elevated but cooling. Avoid budget, RBI, election, CPI/Fed, or major event weeks."
 
@@ -363,6 +397,7 @@ def build_action_plan(kind: str, spot: float, expiry: date, rows: list[OptionRow
     plan = {
         "kind": kind,
         "title": title,
+        "source": source,
         "expiry": expiry.isoformat(),
         "dte": (expiry - base).days,
         "spot": round(spot, 2),
@@ -373,7 +408,9 @@ def build_action_plan(kind: str, spot: float, expiry: date, rows: list[OptionRow
         "wing_width": wing,
         "target_capture": target_capture,
         "stop_multiple": stop_multiple,
-        "min_credit": min_premium * 2 * 0.65,
+        "min_credit": round(wing * min_credit_ratio, 2),
+        "min_target_per_lot": min_target_per_lot,
+        "min_reward_to_risk": min_reward_to_risk,
         "legs": [
             build_leg("SELL", index.get(pe_short_strike), pe_short_strike, "PE", expiry),
             build_leg("SELL", index.get(ce_short_strike), ce_short_strike, "CE", expiry),
@@ -381,15 +418,17 @@ def build_action_plan(kind: str, spot: float, expiry: date, rows: list[OptionRow
             build_leg("BUY", index.get(ce_buy_strike), ce_buy_strike, "CE", expiry),
         ],
         "entry_filter": entry_filter,
-        "invalid_if": "Skip if spot is within 150 points of either short strike, if the selected short side OI starts unwinding sharply, or if net credit is below the minimum threshold.",
+        "invalid_if": "Skip if spot is within 150 points of either short strike, if selected short-side OI starts unwinding sharply, if bid-ask spread is wide, or if any hard gate fails.",
         "exit_plan": "Book 50-60% credit capture. Exit if combined spread loss reaches the stop reference or if spot closes beyond a short strike buffer.",
         "selection_reason": f"PE: {pe_short['reason']} CE: {ce_short['reason']}",
-        "suggested_lots": 1,
+        "suggested_lots": 0,
         "net_credit": None,
         "max_risk": None,
         "target_profit": None,
         "stop_loss": None,
-        "credit_ok": False,
+        "trade_ok": False,
+        "decision": "NO TRADE",
+        "decision_reason": "Not evaluated yet.",
     }
     estimate_values(plan)
     plan["trade_line"] = trade_line(plan)
@@ -438,23 +477,23 @@ def load_action_board_uncached() -> dict[str, object]:
             raise ValueError("NSE option chain returned no usable rows")
         weekly_expiry, monthly_expiry = choose_expiries(expiries, base)
         source = "NSE"
-        status = "Public NSE option-chain data. No broker token required. Cached server-side."
+        status = "Public NSE option-chain data. Broker token not required. Cached server-side."
     except Exception as exc:  # noqa: BLE001 - public NSE can rate-limit/cloud-block hosted apps
         stale = _CACHE.get("board")
         if isinstance(stale, dict) and stale.get("source") == "NSE":
             stale = dict(stale)
-            stale["status"] = f"NSE refresh failed, showing last cached action board. Error: {exc}"
+            stale["status"] = f"NSE refresh failed, showing last cached board. Error: {exc}"
             return stale
         spot, timestamp, expiries, rows = sample_payload()
         weekly_expiry, monthly_expiry = choose_expiries(expiries, base)
         source = "SAMPLE"
-        status = f"NSE refresh failed and no cache exists, showing sample plan. Error: {exc}"
+        status = f"NSE refresh failed and no cache exists, showing SAMPLE no-trade board. Error: {exc}"
 
     weekly_rows = rows_for_expiry(rows, weekly_expiry)
     monthly_rows = rows_for_expiry(rows, monthly_expiry)
     plans = [
-        build_action_plan("weekly", spot, weekly_expiry, weekly_rows),
-        build_action_plan("monthly", spot, monthly_expiry, monthly_rows),
+        build_action_plan("weekly", spot, weekly_expiry, weekly_rows, source),
+        build_action_plan("monthly", spot, monthly_expiry, monthly_rows, source),
     ]
     return {
         "source": source,
@@ -513,7 +552,8 @@ PAGE = """
     .action { padding:16px; }
     .action-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; }
     .action h3 { margin:0 0 4px; font-size:16px; letter-spacing:0; }
-    .badge { border:1px solid var(--line); padding:7px 9px; font-size:12px; background:#fafafa; white-space:nowrap; }
+    .badge { border:1px solid var(--line); padding:7px 9px; font-size:12px; background:#eef7f1; color:var(--green); white-space:nowrap; font-weight:700; }
+    .badge.no { background:#fff7e8; color:var(--amber); }
     .trade { padding:13px; border-radius:8px; background:#111820; color:#e9f2ef; line-height:1.55; font-family: Consolas, ui-monospace, monospace; font-size:13px; margin-bottom:12px; }
     .metrics { display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:8px; margin-bottom:12px; }
     .metric { border:1px solid var(--line); border-radius:8px; padding:10px; background:#fff; }
@@ -542,7 +582,7 @@ PAGE = """
 <body>
   <header>
     <div class="wrap topbar">
-      <div class="brand"><div class="mark">N</div><div><h1>NIFTY Options Action Board</h1><span>Weekly and monthly option-writing plans from public NSE option-chain data</span></div></div>
+      <div class="brand"><div class="mark">N</div><div><h1>NIFTY Options Action Board</h1><span>Trades only appear when reward/risk gates pass</span></div></div>
       <div class="status"><span class="dot {% if board.source == 'SAMPLE' %}sample{% endif %}"></span>{{ board.status }}</div>
     </div>
   </header>
@@ -563,15 +603,15 @@ PAGE = """
             {% for plan in board.plans %}
             <article class="action">
               <div class="action-head">
-                <div><h3>{{ plan.title }}</h3><div class="muted">Expiry {{ plan.expiry }} | DTE {{ plan.dte }} | Lot size {{ plan.lot_size }}</div></div>
-                <div class="badge">{{ plan.suggested_lots }} lot{% if plan.suggested_lots != 1 %}s{% endif %}</div>
+                <div><h3>{{ plan.title }}</h3><div class="muted">Expiry {{ plan.expiry }} | DTE {{ plan.dte }} | Lot size {{ plan.lot_size }} | Metrics: {{ plan.metric_scope }}</div></div>
+                <div class="badge {% if not plan.trade_ok %}no{% endif %}">{{ plan.decision }}</div>
               </div>
               <div class="trade">{{ plan.trade_line }}</div>
               <div class="metrics">
                 <div class="metric"><b>{{ plan.net_credit }}</b><span>Net credit / unit</span></div>
-                <div class="metric"><b>INR {{ '{:,.0f}'.format(plan.max_risk) }}</b><span>Approx max risk</span></div>
-                <div class="metric"><b>INR {{ '{:,.0f}'.format(plan.target_profit) }}</b><span>Target</span></div>
-                <div class="metric"><b>INR {{ '{:,.0f}'.format(plan.stop_loss) }}</b><span>Stop reference</span></div>
+                <div class="metric"><b>INR {{ '{:,.0f}'.format(plan.max_risk) }}</b><span>Max risk shown</span></div>
+                <div class="metric"><b>INR {{ '{:,.0f}'.format(plan.target_profit) }}</b><span>Target shown</span></div>
+                <div class="metric"><b>{{ plan.reward_to_risk_pct }}%</b><span>Target / max risk</span></div>
               </div>
               <table class="legs">
                 <tr><th>Side</th><th>Strike</th><th>Type</th><th>LTP</th><th>OI</th><th>Volume</th><th>IV</th></tr>
@@ -580,7 +620,8 @@ PAGE = """
                 {% endfor %}
               </table>
               <div class="notes">
-                <div class="note">Credit check: <span class="{% if plan.credit_ok %}ok{% else %}warn-text{% endif %}">{% if plan.credit_ok %}OK{% else %}LOW CREDIT{% endif %}</span>. Minimum threshold {{ plan.min_credit }}.</div>
+                <div class="note {% if not plan.trade_ok %}warn{% endif %}">Decision: {{ plan.decision_reason }}</div>
+                <div class="note">Hard gates: credit >= {{ plan.min_credit }}, target/lot >= INR {{ '{:,.0f}'.format(plan.min_target_per_lot) }}, target/risk >= {{ (plan.min_reward_to_risk * 100)|round(1) }}%.</div>
                 <div class="note">Why these strikes: {{ plan.selection_reason }}</div>
                 <div class="note">Entry: {{ plan.entry_filter }}</div>
                 <div class="note warn">Invalid if: {{ plan.invalid_if }}</div>
@@ -596,10 +637,10 @@ PAGE = """
         <section class="section">
           <h2>How To Use</h2>
           <div class="flow">
-            <div class="step"><i>1</i><div><strong>Check source</strong><span>Use only when source is NSE. SAMPLE mode is just a fallback.</span></div></div>
-            <div class="step"><i>2</i><div><strong>Use defined risk</strong><span>Enter hedge legs with short legs. Do not run this naked unless you explicitly choose that risk.</span></div></div>
-            <div class="step"><i>3</i><div><strong>Respect invalidation</strong><span>Skip trades near short strikes, during IV expansion, or during major event risk.</span></div></div>
-            <div class="step"><i>4</i><div><strong>Verify in broker</strong><span>Check margin, liquidity, bid-ask spread, and freeze quantity before placing orders.</span></div></div>
+            <div class="step"><i>1</i><div><strong>Only trade green</strong><span>If decision is NO TRADE, the structure is watchlist context only.</span></div></div>
+            <div class="step"><i>2</i><div><strong>Reject bad asymmetry</strong><span>The board blocks tiny-credit structures such as INR 400 target vs INR 18K risk.</span></div></div>
+            <div class="step"><i>3</i><div><strong>Use defined risk</strong><span>Enter hedge legs with short legs. Do not run this naked unless you explicitly choose that risk.</span></div></div>
+            <div class="step"><i>4</i><div><strong>Verify in broker</strong><span>Check margin, liquidity, bid-ask spread, and event risk before placing orders.</span></div></div>
           </div>
         </section>
         <section class="section">
