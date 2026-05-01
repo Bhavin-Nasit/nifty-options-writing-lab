@@ -272,7 +272,8 @@ def fetch_bhavcopy_for_day(session: requests.Session, day: date) -> tuple[float,
         active = max(rows, key=lambda row: row.ce_oi + row.pe_oi)
         spot = float(active.strike)
     expiries = sorted({row.expiry for row in rows if row.expiry >= day})
-    timestamp = f'{day.strftime('%d %b %Y')} EOD F&O bhavcopy'
+    day_label = day.strftime('%d %b %Y')
+    timestamp = f'{day_label} EOD F&O bhavcopy'
     return spot, timestamp, expiries, rows
 
 
