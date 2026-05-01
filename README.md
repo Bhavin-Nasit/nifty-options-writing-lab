@@ -22,23 +22,19 @@ Kite can still fetch:
 
 ## Render Deployment
 
-The repo includes `app.py`, `requirements.txt`, `runtime.txt`, and `render.yaml`.
-
-Blueprint deploy:
-
-1. Open Render and choose New > Blueprint.
-2. Connect `Bhavin-Nasit/nifty-options-writing-lab`.
-3. Render will read `render.yaml`.
-4. Deploy the `nifty-options-writing-lab` web service.
+Use **New > Web Service** if you want the same flow as your other dashboards. A Blueprint is just infrastructure-as-code: Render reads `render.yaml` and creates/configures the service automatically. A Web Service is the actual running app. Blueprint is useful for many services or reproducible config, but for this repo a manual Web Service is simpler.
 
 Manual web service deploy:
 
 1. Open Render and choose New > Web Service.
 2. Connect `Bhavin-Nasit/nifty-options-writing-lab`.
-3. Use Python runtime.
+3. Runtime: Python.
 4. Build command: `pip install -r requirements.txt`
 5. Start command: `gunicorn app:app`
 6. Health check path: `/healthz`
+7. Add environment variable `PYTHON_VERSION=3.11.11` if Render does not pick it up automatically.
+
+Blueprint deploy is also supported through `render.yaml`, but it is optional.
 
 The deployed app exposes:
 
@@ -48,24 +44,25 @@ The deployed app exposes:
 
 ## Local Setup
 
-From the repository root:
+For the web dashboard only:
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-Copy-Item .env.example .env
-```
-
-Edit `.env` locally. Do not paste API secrets into chat.
-
-Run the dashboard locally:
-
-```powershell
 python app.py
 ```
 
 Open `http://localhost:8050`.
+
+For research and Kite data capture:
+
+```powershell
+pip install -r requirements-research.txt
+Copy-Item .env.example .env
+```
+
+Edit `.env` locally. Do not paste API secrets into chat.
 
 ## Capture Data
 
