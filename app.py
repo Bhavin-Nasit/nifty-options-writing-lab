@@ -576,6 +576,11 @@ def build_pair_plan(kind: str, title: str, spot: float, expiry: date, rows: list
     ce_short = safe_int(ce_zone.get('strike'))
     pe_buy = nearest_strike_with_row(pe_short - wing, rows)
     ce_buy = nearest_strike_with_row(ce_short + wing, rows)
+    pe_signal = pe_zone.get('signal')
+    pe_score = pe_zone.get('score')
+    ce_signal = ce_zone.get('signal')
+    ce_score = ce_zone.get('score')
+    selection_reason = f'PE writer zone {pe_short}: {pe_signal} score {pe_score}. CE writer zone {ce_short}: {ce_signal} score {ce_score}.'
     plan = {
         'kind': kind,
         'title': title,
@@ -602,9 +607,9 @@ def build_pair_plan(kind: str, title: str, spot: float, expiry: date, rows: list
         'entry_filter': params['entry_filter'],
         'invalid_if': params['invalid_if'],
         'exit_plan': params['exit_plan'],
-        'selection_reason': f'PE writer zone {pe_short}: {pe_zone.get('signal')} score {pe_zone.get('score')}. CE writer zone {ce_short}: {ce_zone.get('signal')} score {ce_zone.get('score')}.',
-        'short_pe_score': pe_zone.get('score'),
-        'short_ce_score': ce_zone.get('score'),
+        'selection_reason': selection_reason,
+        'short_pe_score': pe_score,
+        'short_ce_score': ce_score,
     }
     estimate_values(plan)
     credit_ratio = min(safe_number(plan.get('net_credit')) / max(safe_number(plan.get('min_credit')), 1.0), 2.0)
