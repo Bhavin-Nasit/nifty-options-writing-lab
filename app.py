@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import csv
 import json
 import math
 import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from io import StringIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -17,27 +15,42 @@ from flask import Flask, jsonify, render_template_string
 ROOT = Path(__file__).resolve().parent
 CONFIG_DIR = ROOT / "configs"
 IST = ZoneInfo("Asia/Kolkata")
-KITE_BASE_URL = "https://api.kite.trade"
-NIFTY_LTP_KEY = "NSE:NIFTY 50"
+NSE_BASE_URL = "https://www.nseindia.com"
+NSE_CHAIN_URL = f"{NSE_BASE_URL}/api/option-chain-indices?symbol=NIFTY"
+NSE_CHAIN_PAGE = f"{NSE_BASE_URL}/option-chain"
+CACHE_SECONDS = int(os.getenv("NSE_CACHE_SECONDS", "900"))
+NIFTY_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "65"))
 
 app = Flask(__name__)
+_CACHE: dict[str, object] = {"expires_at": datetime.min.replace(tzinfo=IST), "board": None}
 
 
 @dataclass(frozen=True)
-class OptionInstrument:
-    tradingsymbol: str
+class OptionRow:
     expiry: date
     strike: int
-    option_type: str
-    lot_size: int
+    ce_ltp: float
+    pe_ltp: float
+    ce_oi: int
+    pe_oi: int
+    ce_chg_oi: int
+    pe_chg_oi: int
+    ce_volume: int
+    pe_volume: int
+    ce_iv: float
+    pe_iv: float
+
+
+def now_ist() -> datetime:
+    return datetime.now(IST)
 
 
 def today_ist() -> date:
-    return datetime.now(IST).date()
+    return now_ist().date()
 
 
 def now_ist_label() -> str:
-    return datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
+    return now_ist().strftime("%d %b %Y, %I:%M %p IST")
 
 
 def round_to_step(value: float, step: int = 50) -> int:
@@ -50,6 +63,18 @@ def floor_to_step(value: float, step: int = 50) -> int:
 
 def ceil_to_step(value: float, step: int = 50) -> int:
     return int(math.ceil(value / step) * step)
+
+
+def parse_nse_expiry(value: str) -> date:
+    return datetime.strptime(value, "%d-%b-%Y").date()
+
+
+def last_expiry_by_month(expiries: list[date]) -> list[date]:
+    by_month: dict[tuple[int, int], date] = {}
+    for expiry in expiries:
+        key = (expiry.year, expiry.month)
+        by_month[key] = max(expiry, by_month.get(key, expiry))
+    return sorted(by_month.values())
 
 
 def next_tuesday(base: date) -> date:
@@ -76,263 +101,219 @@ def fallback_monthly_expiry(base: date) -> date:
     return expiry
 
 
-def kite_headers() -> dict[str, str] | None:
-    api_key = os.getenv("KITE_API_KEY")
-    access_token = os.getenv("KITE_ACCESS_TOKEN")
-    if not api_key or not access_token:
-        return None
+def nse_headers() -> dict[str, str]:
     return {
-        "X-Kite-Version": "3",
-        "Authorization": f"token {api_key}:{access_token}",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": NSE_CHAIN_PAGE,
+        "Connection": "keep-alive",
     }
 
 
-def kite_get(path: str, headers: dict[str, str], params=None) -> requests.Response:
-    response = requests.get(f"{KITE_BASE_URL}{path}", headers=headers, params=params, timeout=20)
+def fetch_nse_option_chain() -> dict[str, object]:
+    session = requests.Session()
+    session.headers.update(nse_headers())
+    session.get(NSE_BASE_URL, timeout=12)
+    session.get(NSE_CHAIN_PAGE, timeout=12)
+    response = session.get(NSE_CHAIN_URL, timeout=20)
     response.raise_for_status()
-    return response
+    return response.json()
 
 
-def parse_instruments(csv_text: str, base: date) -> list[OptionInstrument]:
-    instruments: list[OptionInstrument] = []
-    for row in csv.DictReader(StringIO(csv_text)):
+def safe_number(value: object, default: float = 0.0) -> float:
+    try:
+        if value in (None, "-"):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_chain(payload: dict[str, object]) -> tuple[float, str, list[date], list[OptionRow]]:
+    records = payload.get("records", {}) if isinstance(payload, dict) else {}
+    spot = safe_number(records.get("underlyingValue"), 0.0) if isinstance(records, dict) else 0.0
+    timestamp = str(records.get("timestamp") or now_ist_label()) if isinstance(records, dict) else now_ist_label()
+    expiry_values = records.get("expiryDates", []) if isinstance(records, dict) else []
+    expiries = sorted(parse_nse_expiry(value) for value in expiry_values)
+
+    rows: list[OptionRow] = []
+    raw_rows = records.get("data", []) if isinstance(records, dict) else []
+    for item in raw_rows:
+        if not isinstance(item, dict) or "expiryDate" not in item:
+            continue
         try:
-            if row.get("segment") != "NFO-OPT":
-                continue
-            if row.get("instrument_type") not in {"CE", "PE"}:
-                continue
-            name = (row.get("name") or "").upper()
-            symbol = row.get("tradingsymbol") or ""
-            if name not in {"", "NIFTY"} and not symbol.startswith("NIFTY"):
-                continue
-            expiry = date.fromisoformat((row.get("expiry") or "")[:10])
-            if expiry < base:
-                continue
-            instruments.append(
-                OptionInstrument(
-                    tradingsymbol=symbol,
+            expiry = parse_nse_expiry(str(item["expiryDate"]))
+            strike = int(safe_number(item.get("strikePrice"), 0))
+            ce = item.get("CE") if isinstance(item.get("CE"), dict) else {}
+            pe = item.get("PE") if isinstance(item.get("PE"), dict) else {}
+            rows.append(
+                OptionRow(
                     expiry=expiry,
-                    strike=int(float(row.get("strike") or 0)),
-                    option_type=row.get("instrument_type") or "",
-                    lot_size=int(float(row.get("lot_size") or 50)),
+                    strike=strike,
+                    ce_ltp=safe_number(ce.get("lastPrice")),
+                    pe_ltp=safe_number(pe.get("lastPrice")),
+                    ce_oi=int(safe_number(ce.get("openInterest"))),
+                    pe_oi=int(safe_number(pe.get("openInterest"))),
+                    ce_chg_oi=int(safe_number(ce.get("changeinOpenInterest"))),
+                    pe_chg_oi=int(safe_number(pe.get("changeinOpenInterest"))),
+                    ce_volume=int(safe_number(ce.get("totalTradedVolume"))),
+                    pe_volume=int(safe_number(pe.get("totalTradedVolume"))),
+                    ce_iv=safe_number(ce.get("impliedVolatility")),
+                    pe_iv=safe_number(pe.get("impliedVolatility")),
                 )
             )
         except (TypeError, ValueError):
             continue
-    return sorted(instruments, key=lambda item: (item.expiry, item.strike, item.option_type))
+    return spot, timestamp, expiries, rows
 
 
-def index_instruments(instruments: list[OptionInstrument]) -> dict[tuple[date, int, str], OptionInstrument]:
-    return {(item.expiry, item.strike, item.option_type): item for item in instruments}
-
-
-def nearest_available_strike(target: int, option_type: str, expiry: date, index: dict[tuple[date, int, str], OptionInstrument]) -> int:
-    strikes = sorted(strike for exp, strike, typ in index if exp == expiry and typ == option_type)
-    if not strikes:
-        return target
-    return min(strikes, key=lambda strike: abs(strike - target))
-
-
-def choose_expiries(instruments: list[OptionInstrument], base: date) -> tuple[date, date]:
-    expiries = sorted({item.expiry for item in instruments if item.expiry >= base})
-    if not expiries:
+def choose_expiries(expiries: list[date], base: date) -> tuple[date, date]:
+    future_expiries = sorted(expiry for expiry in expiries if expiry >= base)
+    if not future_expiries:
         return next_tuesday(base), fallback_monthly_expiry(base)
-
-    weekly = expiries[0]
-    last_by_month: dict[tuple[int, int], date] = {}
-    for expiry in expiries:
-        key = (expiry.year, expiry.month)
-        last_by_month[key] = max(last_by_month.get(key, expiry), expiry)
-    monthly_candidates = sorted(last_by_month.values())
+    weekly = future_expiries[0]
+    monthly_candidates = [expiry for expiry in last_expiry_by_month(future_expiries) if expiry >= base]
     monthly = monthly_candidates[0] if monthly_candidates else fallback_monthly_expiry(base)
     return weekly, monthly
 
 
-def fetch_market_snapshot() -> dict[str, object]:
-    base = today_ist()
-    headers = kite_headers()
-    if not headers:
-        weekly = next_tuesday(base)
-        monthly = fallback_monthly_expiry(base)
+def rows_for_expiry(rows: list[OptionRow], expiry: date) -> list[OptionRow]:
+    return sorted((row for row in rows if row.expiry == expiry), key=lambda row: row.strike)
+
+
+def row_index(rows: list[OptionRow]) -> dict[int, OptionRow]:
+    return {row.strike: row for row in rows}
+
+
+def nearest_strike_with_row(target: int, rows: list[OptionRow]) -> int:
+    if not rows:
+        return target
+    return min((row.strike for row in rows), key=lambda strike: abs(strike - target))
+
+
+def metric_max(candidates: list[dict[str, float]], key: str) -> float:
+    value = max((candidate.get(key, 0.0) for candidate in candidates), default=0.0)
+    return value if value > 0 else 1.0
+
+
+def select_short_candidate(
+    rows: list[OptionRow],
+    option_type: str,
+    spot: float,
+    min_distance: int,
+    max_distance: int,
+    min_premium: float,
+) -> dict[str, object]:
+    candidates: list[dict[str, float]] = []
+    for row in rows:
+        distance = spot - row.strike if option_type == "PE" else row.strike - spot
+        if distance < min_distance or distance > max_distance:
+            continue
+        ltp = row.pe_ltp if option_type == "PE" else row.ce_ltp
+        oi = row.pe_oi if option_type == "PE" else row.ce_oi
+        chg_oi = row.pe_chg_oi if option_type == "PE" else row.ce_chg_oi
+        volume = row.pe_volume if option_type == "PE" else row.ce_volume
+        iv = row.pe_iv if option_type == "PE" else row.ce_iv
+        if ltp < min_premium or oi <= 0:
+            continue
+        candidates.append(
+            {
+                "strike": float(row.strike),
+                "ltp": ltp,
+                "oi": float(oi),
+                "chg_oi": float(max(0, chg_oi)),
+                "volume": float(volume),
+                "iv": iv,
+                "distance": float(distance),
+            }
+        )
+
+    if not candidates:
+        target = floor_to_step(spot - min_distance) if option_type == "PE" else ceil_to_step(spot + min_distance)
+        nearest = nearest_strike_with_row(target, rows)
+        row = row_index(rows).get(nearest)
         return {
-            "source": "sample",
-            "status": "Kite env vars missing. Showing sample action plan from fallback NIFTY spot.",
-            "spot": 24500.0,
-            "as_of": now_ist_label(),
-            "weekly_expiry": weekly,
-            "monthly_expiry": monthly,
-            "instruments": [],
-            "index": {},
-            "headers": None,
+            "strike": nearest,
+            "ltp": row.pe_ltp if row and option_type == "PE" else (row.ce_ltp if row else 0.0),
+            "oi": row.pe_oi if row and option_type == "PE" else (row.ce_oi if row else 0),
+            "chg_oi": row.pe_chg_oi if row and option_type == "PE" else (row.ce_chg_oi if row else 0),
+            "volume": row.pe_volume if row and option_type == "PE" else (row.ce_volume if row else 0),
+            "iv": row.pe_iv if row and option_type == "PE" else (row.ce_iv if row else 0.0),
+            "score": 0.0,
+            "reason": "Fallback nearest strike. Check liquidity manually.",
         }
 
-    try:
-        ltp_payload = kite_get("/quote/ltp", headers, params=[("i", NIFTY_LTP_KEY)]).json()
-        spot = float(ltp_payload["data"][NIFTY_LTP_KEY]["last_price"])
-        instruments_csv = kite_get("/instruments/NFO", headers).text
-        instruments = parse_instruments(instruments_csv, base)
-        weekly, monthly = choose_expiries(instruments, base)
-        return {
-            "source": "kite",
-            "status": "Live Kite data. Refreshes every 5 minutes while market/token is available.",
-            "spot": spot,
-            "as_of": now_ist_label(),
-            "weekly_expiry": weekly,
-            "monthly_expiry": monthly,
-            "instruments": instruments,
-            "index": index_instruments(instruments),
-            "headers": headers,
-        }
-    except Exception as exc:  # noqa: BLE001 - dashboard should degrade gracefully
-        weekly = next_tuesday(base)
-        monthly = fallback_monthly_expiry(base)
-        return {
-            "source": "sample",
-            "status": f"Kite fetch failed: {exc}. Showing sample action plan.",
-            "spot": 24500.0,
-            "as_of": now_ist_label(),
-            "weekly_expiry": weekly,
-            "monthly_expiry": monthly,
-            "instruments": [],
-            "index": {},
-            "headers": None,
-        }
+    max_oi = metric_max(candidates, "oi")
+    max_chg = metric_max(candidates, "chg_oi")
+    max_volume = metric_max(candidates, "volume")
+    max_ltp = metric_max(candidates, "ltp")
+    max_dist = metric_max(candidates, "distance")
+    best = None
+    best_score = -999.0
+    for candidate in candidates:
+        distance_penalty = candidate["distance"] / max_dist
+        score = (
+            0.42 * candidate["oi"] / max_oi
+            + 0.22 * candidate["chg_oi"] / max_chg
+            + 0.18 * candidate["volume"] / max_volume
+            + 0.18 * candidate["ltp"] / max_ltp
+            - 0.10 * distance_penalty
+        )
+        if score > best_score:
+            best_score = score
+            best = candidate
+    assert best is not None
+    best["strike"] = int(best["strike"])
+    best["score"] = round(best_score, 3)
+    best["reason"] = "Selected by OI, positive OI change, volume, premium, and distance buffer."
+    return best
 
 
-def find_contract(expiry: date, strike: int, option_type: str, index: dict[tuple[date, int, str], OptionInstrument]) -> OptionInstrument | None:
-    return index.get((expiry, strike, option_type))
-
-
-def build_leg(side: str, expiry: date, strike: int, option_type: str, lot_size: int, index: dict[tuple[date, int, str], OptionInstrument]) -> dict[str, object]:
-    contract = find_contract(expiry, strike, option_type, index)
+def build_leg(side: str, row: OptionRow | None, strike: int, option_type: str, expiry: date) -> dict[str, object]:
+    if row is None:
+        ltp = 0.0
+        oi = 0
+        volume = 0
+        iv = 0.0
+    elif option_type == "PE":
+        ltp, oi, volume, iv = row.pe_ltp, row.pe_oi, row.pe_volume, row.pe_iv
+    else:
+        ltp, oi, volume, iv = row.ce_ltp, row.ce_oi, row.ce_volume, row.ce_iv
     return {
         "side": side,
         "strike": strike,
         "type": option_type,
         "expiry": expiry.isoformat(),
-        "symbol": contract.tradingsymbol if contract else f"NIFTY {expiry.isoformat()} {strike}{option_type}",
-        "lot_size": contract.lot_size if contract else lot_size,
-        "ltp": None,
+        "symbol": f"NIFTY {expiry.strftime('%d-%b-%Y').upper()} {strike}{option_type}",
+        "ltp": round(float(ltp), 2),
+        "oi": int(oi),
+        "volume": int(volume),
+        "iv": round(float(iv), 2),
     }
 
 
-def price_legs(plans: list[dict[str, object]], headers: dict[str, str] | None) -> None:
-    if not headers:
-        return
-    symbol_to_leg: dict[str, dict[str, object]] = {}
-    params = []
-    for plan in plans:
-        for leg in plan["legs"]:
-            symbol = leg.get("symbol")
-            if isinstance(symbol, str) and symbol.startswith("NIFTY") and " " not in symbol:
-                symbol_to_leg[symbol] = leg
-                params.append(("i", f"NFO:{symbol}"))
-    if not params:
-        return
-    try:
-        payload = kite_get("/quote/ltp", headers, params=params).json().get("data", {})
-        for key, value in payload.items():
-            symbol = key.split(":", 1)[-1]
-            if symbol in symbol_to_leg:
-                symbol_to_leg[symbol]["ltp"] = float(value.get("last_price") or 0)
-    except Exception:
-        return
-
-
-def estimate_plan_values(plan: dict[str, object]) -> None:
+def estimate_values(plan: dict[str, object]) -> None:
     legs = plan["legs"]
-    if any(leg.get("ltp") is None for leg in legs):
-        plan["net_credit"] = None
-        plan["max_risk"] = None
-        plan["suggested_lots"] = 1
-        plan["target_profit"] = None
-        plan["stop_loss"] = None
-        return
-
     credit = sum(float(leg["ltp"]) for leg in legs if leg["side"] == "SELL") - sum(
         float(leg["ltp"]) for leg in legs if leg["side"] == "BUY"
     )
-    lot_size = int(legs[0].get("lot_size") or 50)
     wing = int(plan["wing_width"])
+    lot_size = int(plan["lot_size"])
     max_risk_per_lot = max(0.0, (wing - credit) * lot_size)
     risk_budget = float(plan["capital"]) * float(plan["risk_pct"])
-    lots = 1 if max_risk_per_lot <= 0 else max(1, min(int(plan["max_lots"]), int(risk_budget // max_risk_per_lot)))
-
+    if max_risk_per_lot <= 0:
+        lots = 1
+    else:
+        lots = max(1, min(int(plan["max_lots"]), int(risk_budget // max_risk_per_lot)))
+    plan["suggested_lots"] = lots
     plan["net_credit"] = round(credit, 2)
     plan["max_risk"] = round(max_risk_per_lot * lots, 0)
-    plan["suggested_lots"] = lots
     plan["target_profit"] = round(credit * lot_size * lots * float(plan["target_capture"]), 0)
     plan["stop_loss"] = round(credit * lot_size * lots * float(plan["stop_multiple"]), 0)
-
-
-def build_action_plan(kind: str, snapshot: dict[str, object]) -> dict[str, object]:
-    base = today_ist()
-    spot = float(snapshot["spot"])
-    index = snapshot["index"]
-    atm = round_to_step(spot)
-
-    if kind == "weekly":
-        expiry = snapshot["weekly_expiry"]
-        distance = max(350, ceil_to_step(spot * 0.025))
-        wing = 300
-        capital = 400000
-        risk_pct = 0.06
-        max_lots = 3
-        target_capture = 0.55
-        stop_multiple = 1.75
-        title = "Weekly Iron Condor"
-        timing = "Plan after the first 30-45 minutes. Avoid new entry if NIFTY is trending beyond the morning range."
-    else:
-        expiry = snapshot["monthly_expiry"]
-        distance = max(700, ceil_to_step(spot * 0.045))
-        wing = 500
-        capital = 400000
-        risk_pct = 0.045
-        max_lots = 2
-        target_capture = 0.60
-        stop_multiple = 1.90
-        title = "Monthly Wide Iron Condor"
-        timing = "Prefer entry only when VIX/IV is elevated but cooling. Avoid major event weeks."
-
-    expiry = expiry if isinstance(expiry, date) else date.fromisoformat(str(expiry))
-    pe_short = nearest_available_strike(floor_to_step(atm - distance), "PE", expiry, index)
-    ce_short = nearest_available_strike(ceil_to_step(atm + distance), "CE", expiry, index)
-    pe_buy = nearest_available_strike(pe_short - wing, "PE", expiry, index)
-    ce_buy = nearest_available_strike(ce_short + wing, "CE", expiry, index)
-    lot_size = 50
-    first_contract = find_contract(expiry, pe_short, "PE", index) or find_contract(expiry, ce_short, "CE", index)
-    if first_contract:
-        lot_size = first_contract.lot_size
-
-    dte = (expiry - base).days
-    plan = {
-        "kind": kind,
-        "title": title,
-        "expiry": expiry.isoformat(),
-        "dte": dte,
-        "spot": round(spot, 2),
-        "capital": capital,
-        "risk_pct": risk_pct,
-        "max_lots": max_lots,
-        "wing_width": wing,
-        "target_capture": target_capture,
-        "stop_multiple": stop_multiple,
-        "legs": [
-            build_leg("SELL", expiry, pe_short, "PE", lot_size, index),
-            build_leg("SELL", expiry, ce_short, "CE", lot_size, index),
-            build_leg("BUY", expiry, pe_buy, "PE", lot_size, index),
-            build_leg("BUY", expiry, ce_buy, "CE", lot_size, index),
-        ],
-        "entry_filter": timing,
-        "invalid_if": "Do not enter if spot is within 150 points of either short strike, if IV is expanding sharply, or if the net credit is too small versus max risk.",
-        "exit_plan": "Book 50-60% of credit or exit if combined spread loss reaches the stop. Avoid holding near-ATM shorts into the final settlement window.",
-        "suggested_lots": 1,
-        "net_credit": None,
-        "max_risk": None,
-        "target_profit": None,
-        "stop_loss": None,
-    }
-    return plan
+    plan["risk_budget"] = round(risk_budget, 0)
+    plan["credit_ok"] = credit >= float(plan["min_credit"])
 
 
 def trade_line(plan: dict[str, object]) -> str:
@@ -344,20 +325,157 @@ def trade_line(plan: dict[str, object]) -> str:
     return f"{sell_text}; hedge with {buy_text}"
 
 
-def load_action_board() -> dict[str, object]:
-    snapshot = fetch_market_snapshot()
-    plans = [build_action_plan("weekly", snapshot), build_action_plan("monthly", snapshot)]
-    price_legs(plans, snapshot.get("headers"))
-    for plan in plans:
-        estimate_plan_values(plan)
-        plan["trade_line"] = trade_line(plan)
+def build_action_plan(kind: str, spot: float, expiry: date, rows: list[OptionRow]) -> dict[str, object]:
+    base = today_ist()
+    if kind == "weekly":
+        min_distance = max(300, ceil_to_step(spot * 0.018))
+        max_distance = max(900, ceil_to_step(spot * 0.055))
+        min_premium = 8.0
+        wing = 300
+        capital = 400000
+        risk_pct = 0.06
+        max_lots = 3
+        target_capture = 0.55
+        stop_multiple = 1.75
+        title = "Weekly OI-Supported Iron Condor"
+        entry_filter = "Use after the first 30-45 minutes. Enter only if spot remains between the short strikes and market breadth is not one-way trending."
+    else:
+        min_distance = max(650, ceil_to_step(spot * 0.04))
+        max_distance = max(1900, ceil_to_step(spot * 0.10))
+        min_premium = 15.0
+        wing = 500
+        capital = 400000
+        risk_pct = 0.045
+        max_lots = 2
+        target_capture = 0.60
+        stop_multiple = 1.90
+        title = "Monthly OI-Supported Wide Iron Condor"
+        entry_filter = "Prefer entry when VIX/IV is elevated but cooling. Avoid budget, RBI, election, CPI/Fed, or major event weeks."
+
+    index = row_index(rows)
+    pe_short = select_short_candidate(rows, "PE", spot, min_distance, max_distance, min_premium)
+    ce_short = select_short_candidate(rows, "CE", spot, min_distance, max_distance, min_premium)
+    pe_short_strike = int(pe_short["strike"])
+    ce_short_strike = int(ce_short["strike"])
+    pe_buy_strike = nearest_strike_with_row(pe_short_strike - wing, rows)
+    ce_buy_strike = nearest_strike_with_row(ce_short_strike + wing, rows)
+
+    plan = {
+        "kind": kind,
+        "title": title,
+        "expiry": expiry.isoformat(),
+        "dte": (expiry - base).days,
+        "spot": round(spot, 2),
+        "capital": capital,
+        "risk_pct": risk_pct,
+        "max_lots": max_lots,
+        "lot_size": NIFTY_LOT_SIZE,
+        "wing_width": wing,
+        "target_capture": target_capture,
+        "stop_multiple": stop_multiple,
+        "min_credit": min_premium * 2 * 0.65,
+        "legs": [
+            build_leg("SELL", index.get(pe_short_strike), pe_short_strike, "PE", expiry),
+            build_leg("SELL", index.get(ce_short_strike), ce_short_strike, "CE", expiry),
+            build_leg("BUY", index.get(pe_buy_strike), pe_buy_strike, "PE", expiry),
+            build_leg("BUY", index.get(ce_buy_strike), ce_buy_strike, "CE", expiry),
+        ],
+        "entry_filter": entry_filter,
+        "invalid_if": "Skip if spot is within 150 points of either short strike, if the selected short side OI starts unwinding sharply, or if net credit is below the minimum threshold.",
+        "exit_plan": "Book 50-60% credit capture. Exit if combined spread loss reaches the stop reference or if spot closes beyond a short strike buffer.",
+        "selection_reason": f"PE: {pe_short['reason']} CE: {ce_short['reason']}",
+        "suggested_lots": 1,
+        "net_credit": None,
+        "max_risk": None,
+        "target_profit": None,
+        "stop_loss": None,
+        "credit_ok": False,
+    }
+    estimate_values(plan)
+    plan["trade_line"] = trade_line(plan)
+    return plan
+
+
+def sample_payload() -> tuple[float, str, list[date], list[OptionRow]]:
+    base = today_ist()
+    weekly = next_tuesday(base)
+    monthly = fallback_monthly_expiry(base)
+    spot = 24500.0
+    rows: list[OptionRow] = []
+    for expiry in [weekly, monthly]:
+        for strike in range(22000, 27050, 50):
+            distance = abs(strike - spot)
+            base_premium = max(4.0, 120.0 - distance * 0.11)
+            ce_ltp = round(base_premium if strike >= spot else base_premium + (spot - strike), 2)
+            pe_ltp = round(base_premium if strike <= spot else base_premium + (strike - spot), 2)
+            ce_oi = max(50, int(9000 - abs(strike - 25500) * 8)) if strike >= spot else max(50, int(2200 - distance * 2))
+            pe_oi = max(50, int(9000 - abs(strike - 23500) * 8)) if strike <= spot else max(50, int(2200 - distance * 2))
+            rows.append(
+                OptionRow(
+                    expiry=expiry,
+                    strike=strike,
+                    ce_ltp=ce_ltp,
+                    pe_ltp=pe_ltp,
+                    ce_oi=ce_oi,
+                    pe_oi=pe_oi,
+                    ce_chg_oi=max(0, ce_oi // 8),
+                    pe_chg_oi=max(0, pe_oi // 8),
+                    ce_volume=max(10, ce_oi // 5),
+                    pe_volume=max(10, pe_oi // 5),
+                    ce_iv=13.5,
+                    pe_iv=14.0,
+                )
+            )
+    return spot, now_ist_label(), [weekly, monthly], rows
+
+
+def load_action_board_uncached() -> dict[str, object]:
+    base = today_ist()
+    try:
+        payload = fetch_nse_option_chain()
+        spot, timestamp, expiries, rows = parse_chain(payload)
+        if spot <= 0 or not rows:
+            raise ValueError("NSE option chain returned no usable rows")
+        weekly_expiry, monthly_expiry = choose_expiries(expiries, base)
+        source = "NSE"
+        status = "Public NSE option-chain data. No broker token required. Cached server-side."
+    except Exception as exc:  # noqa: BLE001 - public NSE can rate-limit/cloud-block hosted apps
+        stale = _CACHE.get("board")
+        if isinstance(stale, dict) and stale.get("source") == "NSE":
+            stale = dict(stale)
+            stale["status"] = f"NSE refresh failed, showing last cached action board. Error: {exc}"
+            return stale
+        spot, timestamp, expiries, rows = sample_payload()
+        weekly_expiry, monthly_expiry = choose_expiries(expiries, base)
+        source = "SAMPLE"
+        status = f"NSE refresh failed and no cache exists, showing sample plan. Error: {exc}"
+
+    weekly_rows = rows_for_expiry(rows, weekly_expiry)
+    monthly_rows = rows_for_expiry(rows, monthly_expiry)
+    plans = [
+        build_action_plan("weekly", spot, weekly_expiry, weekly_rows),
+        build_action_plan("monthly", spot, monthly_expiry, monthly_rows),
+    ]
     return {
-        "source": snapshot["source"],
-        "status": snapshot["status"],
-        "spot": snapshot["spot"],
-        "as_of": snapshot["as_of"],
+        "source": source,
+        "status": status,
+        "spot": round(spot, 2),
+        "as_of": timestamp,
+        "server_refreshed_at": now_ist_label(),
+        "cache_seconds": CACHE_SECONDS,
+        "lot_size": NIFTY_LOT_SIZE,
         "plans": plans,
     }
+
+
+def load_action_board() -> dict[str, object]:
+    expires_at = _CACHE.get("expires_at")
+    if isinstance(expires_at, datetime) and expires_at > now_ist() and isinstance(_CACHE.get("board"), dict):
+        return _CACHE["board"]  # type: ignore[return-value]
+    board = load_action_board_uncached()
+    _CACHE["board"] = board
+    _CACHE["expires_at"] = now_ist() + timedelta(seconds=CACHE_SECONDS)
+    return board
 
 
 PAGE = """
@@ -369,7 +487,7 @@ PAGE = """
   <meta http-equiv="refresh" content="300">
   <title>NIFTY Options Action Board</title>
   <style>
-    :root { --ink:#172026; --muted:#59656f; --line:#d7dde2; --panel:#ffffff; --page:#f4f7f5; --green:#0f7a55; --amber:#b7791f; --red:#b42318; --teal:#0e7490; --slate:#243746; }
+    :root { --ink:#172026; --muted:#59656f; --line:#d7dde2; --panel:#ffffff; --page:#f4f7f5; --green:#0f7a55; --amber:#b7791f; --red:#b42318; --teal:#0e7490; }
     * { box-sizing: border-box; }
     body { margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:var(--ink); background:var(--page); }
     header { border-bottom:1px solid var(--line); background:#fbfcfb; }
@@ -379,7 +497,7 @@ PAGE = """
     .mark { width:38px; height:38px; border:2px solid var(--green); display:grid; place-items:center; font-weight:800; color:var(--green); }
     h1 { margin:0; font-size:20px; line-height:1.2; letter-spacing:0; }
     .brand span, .muted { color:var(--muted); font-size:13px; }
-    .status { display:flex; align-items:center; gap:9px; padding:8px 11px; border:1px solid var(--line); background:#fff; font-size:13px; max-width:460px; }
+    .status { display:flex; align-items:center; gap:9px; padding:8px 11px; border:1px solid var(--line); background:#fff; font-size:13px; max-width:520px; }
     .dot { width:9px; height:9px; border-radius:99px; background:var(--green); flex:0 0 auto; }
     .dot.sample { background:var(--amber); }
     main { padding:26px 0 40px; }
@@ -406,6 +524,8 @@ PAGE = """
     .legs th { color:var(--muted); font-weight:650; }
     .sell { color:var(--red); font-weight:700; }
     .buy { color:var(--green); font-weight:700; }
+    .ok { color:var(--green); font-weight:700; }
+    .warn-text { color:var(--amber); font-weight:700; }
     .notes { display:grid; gap:8px; }
     .note { border-left:3px solid var(--teal); padding:8px 10px; background:#f8fbfb; color:#34424d; font-size:13px; line-height:1.45; }
     .note.warn { border-color:var(--amber); background:#fff9ef; }
@@ -422,17 +542,17 @@ PAGE = """
 <body>
   <header>
     <div class="wrap topbar">
-      <div class="brand"><div class="mark">N</div><div><h1>NIFTY Options Action Board</h1><span>Weekly and monthly option-writing plans from available data</span></div></div>
-      <div class="status"><span class="dot {% if board.source == 'sample' %}sample{% endif %}"></span>{{ board.status }}</div>
+      <div class="brand"><div class="mark">N</div><div><h1>NIFTY Options Action Board</h1><span>Weekly and monthly option-writing plans from public NSE option-chain data</span></div></div>
+      <div class="status"><span class="dot {% if board.source == 'SAMPLE' %}sample{% endif %}"></span>{{ board.status }}</div>
     </div>
   </header>
 
   <main class="wrap">
     <div class="hero">
       <div class="kpi"><b>{{ '%.2f'|format(board.spot) }}</b><span>NIFTY spot used for strike selection</span></div>
-      <div class="kpi"><b>{{ board.source|upper }}</b><span>Data source</span></div>
-      <div class="kpi"><b>{{ board.as_of }}</b><span>Last refresh</span></div>
-      <div class="kpi"><b>5 min</b><span>Auto-refresh interval</span></div>
+      <div class="kpi"><b>{{ board.source }}</b><span>Data source</span></div>
+      <div class="kpi"><b>{{ board.as_of }}</b><span>NSE chain timestamp</span></div>
+      <div class="kpi"><b>{{ board.cache_seconds // 60 }} min</b><span>Server cache interval</span></div>
     </div>
 
     <div class="grid">
@@ -443,23 +563,25 @@ PAGE = """
             {% for plan in board.plans %}
             <article class="action">
               <div class="action-head">
-                <div><h3>{{ plan.title }}</h3><div class="muted">Expiry {{ plan.expiry }} | DTE {{ plan.dte }} | Spot {{ plan.spot }}</div></div>
+                <div><h3>{{ plan.title }}</h3><div class="muted">Expiry {{ plan.expiry }} | DTE {{ plan.dte }} | Lot size {{ plan.lot_size }}</div></div>
                 <div class="badge">{{ plan.suggested_lots }} lot{% if plan.suggested_lots != 1 %}s{% endif %}</div>
               </div>
               <div class="trade">{{ plan.trade_line }}</div>
               <div class="metrics">
-                <div class="metric"><b>{% if plan.net_credit is not none %}{{ plan.net_credit }}{% else %}Needs Kite{% endif %}</b><span>Net credit / unit</span></div>
-                <div class="metric"><b>{% if plan.max_risk is not none %}₹{{ '{:,.0f}'.format(plan.max_risk) }}{% else %}Needs prices{% endif %}</b><span>Approx max risk</span></div>
-                <div class="metric"><b>{% if plan.target_profit is not none %}₹{{ '{:,.0f}'.format(plan.target_profit) }}{% else %}50-60% credit{% endif %}</b><span>Target</span></div>
-                <div class="metric"><b>{% if plan.stop_loss is not none %}₹{{ '{:,.0f}'.format(plan.stop_loss) }}{% else %}Credit multiple{% endif %}</b><span>Stop reference</span></div>
+                <div class="metric"><b>{{ plan.net_credit }}</b><span>Net credit / unit</span></div>
+                <div class="metric"><b>INR {{ '{:,.0f}'.format(plan.max_risk) }}</b><span>Approx max risk</span></div>
+                <div class="metric"><b>INR {{ '{:,.0f}'.format(plan.target_profit) }}</b><span>Target</span></div>
+                <div class="metric"><b>INR {{ '{:,.0f}'.format(plan.stop_loss) }}</b><span>Stop reference</span></div>
               </div>
               <table class="legs">
-                <tr><th>Side</th><th>Strike</th><th>Type</th><th>Symbol</th><th>LTP</th></tr>
+                <tr><th>Side</th><th>Strike</th><th>Type</th><th>LTP</th><th>OI</th><th>Volume</th><th>IV</th></tr>
                 {% for leg in plan.legs %}
-                <tr><td class="{{ leg.side|lower }}">{{ leg.side }}</td><td>{{ leg.strike }}</td><td>{{ leg.type }}</td><td>{{ leg.symbol }}</td><td>{% if leg.ltp is not none %}{{ leg.ltp }}{% else %}-{% endif %}</td></tr>
+                <tr><td class="{{ leg.side|lower }}">{{ leg.side }}</td><td>{{ leg.strike }}</td><td>{{ leg.type }}</td><td>{{ leg.ltp }}</td><td>{{ '{:,.0f}'.format(leg.oi) }}</td><td>{{ '{:,.0f}'.format(leg.volume) }}</td><td>{{ leg.iv }}</td></tr>
                 {% endfor %}
               </table>
               <div class="notes">
+                <div class="note">Credit check: <span class="{% if plan.credit_ok %}ok{% else %}warn-text{% endif %}">{% if plan.credit_ok %}OK{% else %}LOW CREDIT{% endif %}</span>. Minimum threshold {{ plan.min_credit }}.</div>
+                <div class="note">Why these strikes: {{ plan.selection_reason }}</div>
                 <div class="note">Entry: {{ plan.entry_filter }}</div>
                 <div class="note warn">Invalid if: {{ plan.invalid_if }}</div>
                 <div class="note">Exit: {{ plan.exit_plan }}</div>
@@ -474,16 +596,15 @@ PAGE = """
         <section class="section">
           <h2>How To Use</h2>
           <div class="flow">
-            <div class="step"><i>1</i><div><strong>Check source</strong><span>If source is SAMPLE, add Kite env vars in Render before trusting strikes.</span></div></div>
-            <div class="step"><i>2</i><div><strong>Prefer defined risk</strong><span>Enter the hedge legs with the short legs, not later.</span></div></div>
-            <div class="step"><i>3</i><div><strong>Respect invalidation</strong><span>Skip trades near short strikes, during IV expansion, or event risk.</span></div></div>
-            <div class="step"><i>4</i><div><strong>Refresh before order</strong><span>Use the board as a planning input, then verify in Zerodha order window.</span></div></div>
+            <div class="step"><i>1</i><div><strong>Check source</strong><span>Use only when source is NSE. SAMPLE mode is just a fallback.</span></div></div>
+            <div class="step"><i>2</i><div><strong>Use defined risk</strong><span>Enter hedge legs with short legs. Do not run this naked unless you explicitly choose that risk.</span></div></div>
+            <div class="step"><i>3</i><div><strong>Respect invalidation</strong><span>Skip trades near short strikes, during IV expansion, or during major event risk.</span></div></div>
+            <div class="step"><i>4</i><div><strong>Verify in broker</strong><span>Check margin, liquidity, bid-ask spread, and freeze quantity before placing orders.</span></div></div>
           </div>
         </section>
         <section class="section">
-          <h2>Render Env Vars</h2>
-          <code>KITE_API_KEY=...<br>KITE_ACCESS_TOKEN=...</code>
-          <p class="muted">Kite access tokens are daily tokens. If the token expires, the board safely falls back to sample mode.</p>
+          <h2>No Manual Token</h2>
+          <code>Data source: NSE public option chain<br>Broker token: not required<br>Optional env: NIFTY_LOT_SIZE, NSE_CACHE_SECONDS</code>
         </section>
       </aside>
     </div>
