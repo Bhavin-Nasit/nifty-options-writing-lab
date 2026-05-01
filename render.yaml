@@ -7,3 +7,6 @@ services:
     startCommand: gunicorn app:app
     healthCheckPath: /healthz
     autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
