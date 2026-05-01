@@ -1,6 +1,6 @@
 # NIFTY Options Writing Research Lab
 
-This repository contains a hosted NIFTY options action board plus research scripts for option-writing backtests. The Render dashboard now uses public NSE option-chain data and does not require daily Kite token updates.
+This repository contains a hosted NIFTY options action board plus research scripts for option-writing backtests. The Render dashboard uses public NSE option-chain data and does not require daily Kite token updates.
 
 It is built for research, not live trading. No strategy here should be treated as a sure-shot signal. Option writing can show a high win rate while hiding rare, large losses, so the reports focus on drawdown, tail loss, realistic charges, and position sizing.
 
@@ -10,9 +10,10 @@ The dashboard derives weekly and monthly writing plans from the public NSE NIFTY
 
 - NIFTY spot from the option-chain payload.
 - Current weekly and monthly expiries from NSE expiry dates.
-- PE/CE short strikes selected using OI, positive OI change, traded volume, premium, and distance buffer.
-- Hedge strikes added automatically to form defined-risk iron condors.
-- Net credit, approximate max risk, target, stop reference, OI, volume, and IV shown on screen.
+- PE/CE writer zones selected using OI, positive OI change, traded volume, premium, and distance buffer.
+- Short put zones are shown as support/writer areas; short call zones are shown as resistance/writer areas.
+- Hedge strikes are added automatically to form defined-risk iron condors.
+- Net credit, approximate max risk, target, stop reference, OI, volume, IV, and hard rejection reason are shown on screen.
 
 No broker token is required. The app caches NSE data server-side for `NSE_CACHE_SECONDS`, default `900` seconds.
 
@@ -23,7 +24,11 @@ NSE_CACHE_SECONDS=900
 NIFTY_LOT_SIZE=65
 ```
 
-If NSE blocks or rate-limits the hosted request and no cached board exists, the app clearly switches to SAMPLE mode. Do not trade from SAMPLE mode.
+If NSE blocks or rate-limits the hosted request and no cached board exists, the app does not generate sample trades. It shows live-data unavailable and waits for a successful NSE refresh.
+
+## Data Reality
+
+Strike-level FII or hedge-fund short positioning is not published live in India. The closest public proxy is aggregate option-chain OI and OI change by strike. NSE participant OI can show category-level index option shorts for FII/Client/Pro/DII, but that file is not strike-specific. The dashboard therefore labels the strike map as a writer/OI proxy, not a guaranteed FII short map.
 
 ## Important Data Limitation
 
@@ -53,7 +58,7 @@ Blueprint deploy is also supported through `render.yaml`, but it is optional.
 
 The deployed app exposes:
 
-- `/` action board
+- `/` live writer map and action board
 - `/api/action-plan` JSON action plan
 - `/api/strategy-configs` strategy config JSON
 - `/healthz` Render health check
