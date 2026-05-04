@@ -1,21 +1,27 @@
 # NIFTY Options Writing Research Lab
 
-This repository contains a hosted NIFTY options action board plus research scripts for option-writing backtests. The Render dashboard uses public NSE option-chain data and does not require daily Kite token updates.
+This repository contains a hosted NIFTY strategy engine plus research scripts for option-writing backtests. The Render dashboard uses public NSE data and does not require daily Kite token updates.
 
-It is built for research, not live trading. No strategy here should be treated as a sure-shot signal. Option writing can show a high win rate while hiding rare, large losses, so the reports focus on drawdown, tail loss, realistic charges, and position sizing.
+It is built for research and trade preparation, not as a guaranteed signal engine. Option writing can show a high win rate while hiding rare, large losses.
 
-## Hosted Action Board
+## Hosted Strategy Engine
 
-The dashboard derives weekly and monthly writing plans from the public NSE NIFTY option chain:
+The dashboard is now a trade-prep cockpit:
 
-- NIFTY spot from the option-chain payload.
-- Current weekly and monthly expiries from NSE expiry dates.
-- PE/CE writer zones selected using OI, positive OI change, traded volume, premium, and distance buffer.
-- Short put zones are shown as support/writer areas; short call zones are shown as resistance/writer areas.
-- Hedge strikes are added automatically to form defined-risk iron condors.
-- Net credit, approximate max risk, target, stop reference, OI, volume, IV, and hard rejection reason are shown on screen.
+- Market regime: range, bullish range, bearish range, expiry pin risk, mixed, or no trade.
+- Writer map: PE support/writer zones and CE resistance/writer zones from OI, OI change, volume, premium, and option price change.
+- Strategy selector: bull put spread, bear call spread, weekly iron condor, expiry intraday iron fly, or monthly wide iron condor.
+- Recommended trade card: exact legs, credit, estimated max risk, target, stop reference, confidence, entry rule, and invalidation.
+- Alternative strategy table: compares rejected and alternate structures.
+- Participant bias: FII, PRO, Client, and DII index derivatives positioning when the NSE participant OI archive is available.
 
-No broker token is required. The app caches NSE data server-side for `NSE_CACHE_SECONDS`, default `900` seconds.
+Data flow:
+
+1. Try live NSE option-chain data.
+2. If live NSE returns no usable rows, fall back to latest real NSE F&O bhavcopy EOD data.
+3. If both fail, show no trade. The app does not generate sample trades.
+
+When source is `NSE_EOD`, treat the trade card as an opening-plan candidate only. Verify live Zerodha LTP, bid-ask spread, margin, and execution price before placing any order.
 
 Optional Render environment variables:
 
@@ -24,29 +30,17 @@ NSE_CACHE_SECONDS=900
 NIFTY_LOT_SIZE=65
 ```
 
-If NSE blocks or rate-limits the hosted request and no cached board exists, the app does not generate sample trades. It shows live-data unavailable and waits for a successful NSE refresh.
-
 ## Data Reality
 
-Strike-level FII or hedge-fund short positioning is not published live in India. The closest public proxy is aggregate option-chain OI and OI change by strike. NSE participant OI can show category-level index option shorts for FII/Client/Pro/DII, but that file is not strike-specific. The dashboard therefore labels the strike map as a writer/OI proxy, not a guaranteed FII short map.
-
-## Important Data Limitation
-
-The hosted dashboard is for planning weekly/monthly writing candidates from currently available option-chain data. It is not a full institutional backtest by itself. A true 5-year NIFTY options backtest still needs one of these:
-
-1. Your own archived option instrument dumps and historical option candles.
-2. A paid vendor export containing historical NIFTY option chains.
-3. NSE F&O bhavcopy/UDiFF archives for EOD-level testing, with intraday tests limited to the period where you have intraday options data.
-
-Kite can still be used locally for historical/recent candles, but it is not required for the hosted dashboard.
+Strike-level FII or hedge-fund short positioning is not published live in India. The closest public proxy is aggregate option-chain or bhavcopy OI and OI change by strike. NSE participant OI is category-level and EOD, not strike-specific.
 
 ## Render Deployment
 
-Use New > Web Service if you want the same flow as your other dashboards.
+Use **New > Web Service** if you want the same flow as your other dashboards.
 
 Manual web service deploy:
 
-1. Open Render and choose New > Web Service.
+1. Open Render and choose **New > Web Service**.
 2. Connect `Bhavin-Nasit/nifty-options-writing-lab`.
 3. Runtime: Python.
 4. Build command: `pip install -r requirements.txt`
@@ -54,106 +48,20 @@ Manual web service deploy:
 6. Health check path: `/healthz`
 7. Optional env vars: `NSE_CACHE_SECONDS=900`, `NIFTY_LOT_SIZE=65`.
 
-Blueprint deploy is also supported through `render.yaml`, but it is optional.
-
 The deployed app exposes:
 
-- `/` live writer map and action board
-- `/api/action-plan` JSON action plan
+- `/` strategy engine dashboard
+- `/api/action-plan` JSON strategy engine output
 - `/api/strategy-configs` strategy config JSON
 - `/healthz` Render health check
 
-## Local Setup
+## Research Data Limitation
 
-For the web dashboard only:
-
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-python app.py
-```
-
-Open `http://localhost:8050`.
-
-For research and optional Kite data capture:
-
-```powershell
-pip install -r requirements-research.txt
-Copy-Item .env.example .env
-```
-
-Edit `.env` locally only if you are running Kite capture scripts.
-
-## Capture Data
-
-Snapshot the current Kite instrument dump:
-
-```powershell
-python run.py snapshot-instruments --env .env
-```
-
-Fetch NIFTY spot candles:
-
-```powershell
-python run.py fetch-spot --env .env --from 2024-01-01 --to 2024-12-31 --interval 5minute
-```
-
-Fetch currently active NIFTY option candles:
-
-```powershell
-python run.py fetch-active-options --env .env --from 2026-04-01 --to 2026-04-29 --interval 5minute --max-contracts 40
-```
-
-For old 5-year option backtests, place a normalized options CSV at:
-
-```text
-data\processed\nifty_options.csv
-```
-
-Expected columns:
-
-```text
-timestamp,expiry,strike,option_type,open,high,low,close,volume,oi,tradingsymbol,lot_size
-```
-
-Place NIFTY spot candles at:
-
-```text
-data\processed\nifty_spot.csv
-```
-
-Expected columns:
-
-```text
-timestamp,open,high,low,close,volume
-```
-
-## Run Backtests
-
-Expiry-day defined-risk iron fly:
-
-```powershell
-python run.py backtest --options data\processed\nifty_options.csv --spot data\processed\nifty_spot.csv --config configs\expiry_intraday_iron_fly.json --out reports
-```
-
-Weekly positional iron condor:
-
-```powershell
-python run.py backtest --options data\processed\nifty_options.csv --spot data\processed\nifty_spot.csv --config configs\weekly_positional_iron_condor.json --out reports
-```
-
-Build daily institutional/volatility features:
-
-```powershell
-python run.py build-features --spot data\processed\nifty_spot.csv --participant-oi data\processed\participant_oi.csv --fii-derivatives data\processed\fii_derivatives.csv --vix data\processed\india_vix.csv
-```
+The hosted dashboard is for current trade preparation. A true 5-year options backtest still needs archived options candles or vendor data. Kite can still be used locally for historical or recent candles, but it is not required for the hosted dashboard.
 
 ## Strategy Defaults
 
-- Intraday expiry capital: `1800000`
-- Positional capital: `400000`
-- Hosted action board: defined-risk iron condor candidates only
-- Costs in the research backtester: Zerodha F&O options brokerage, STT on sell premium, NSE transaction charges, SEBI charges, stamp duty on buy side, GST
-
-Read `STRATEGY_NOTES.md` for the research assumptions behind weekly, monthly, and longer-dated writing.
+- Intraday expiry capital model: `1800000`
+- Positional capital model: `400000`
+- Hosted dashboard: defined-risk structures only
+- Research backtester costs: Zerodha F&O options brokerage, STT on sell premium, NSE transaction charges, SEBI charges, stamp duty on buy side, and GST
