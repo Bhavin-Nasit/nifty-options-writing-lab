@@ -18,8 +18,9 @@ The dashboard is now a trade-prep cockpit:
 Data flow:
 
 1. Try live NSE option-chain data.
-2. If live NSE returns no usable rows, fall back to latest real NSE F&O bhavcopy EOD data.
-3. If both fail, show no trade. The app does not generate sample trades.
+2. If live NSE returns no usable rows, fall back to latest real NSE F&O UDiFF bhavcopy from `nsearchives.nseindia.com`.
+3. If UDiFF is unavailable, try the older legacy F&O bhavcopy archive format.
+4. If all real sources fail, show no trade. The app does not generate sample trades.
 
 When source is `NSE_EOD`, treat the trade card as an opening-plan candidate only. Verify live Zerodha LTP, bid-ask spread, margin, and execution price before placing any order.
 
